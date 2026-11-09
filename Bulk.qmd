@@ -1,431 +1,367 @@
 ---
-title: "Bulk"
+title: "Bulk RNA-seq analysis"
 format: html
+editor: visual
 ---
 
-## Load all the librires:
+## Introduction
 
-```{r Load librires}
+Differential expression analysis of bulk RNA-seq data (GEO: GSE301776) from control mice and mice 6 hours, 1 day and 3 days after AEC injection (n = 4 per group). Each time point is compared with Ctrl using DESeq2, followed by over-representation analysis (g:Profiler) and gene set enrichment analysis (GSEA; GO:BP and KEGG).
+
+**Input files** (place in `data/bulk/`, relative to this notebook):
+
+| File               | Content                                                                                                                                         |
+|------------------------------------|------------------------------------|
+| `gene_count.xls`   | Tab-separated raw read counts; columns `gene_id`, one per sample, `gene_name`, `gene_description`                                               |
+| `gene_fpkm.xls`    | Tab-separated FPKM values; columns `gene_id` and one per sample                                                                                 |
+| `studydesign2.xls` | Tab-separated sample sheet; columns `Sample` (count column name), `SampleID` (display name), `Treatment` (`Ctrl`, `6_Hours`, `1_Day`, `3_Days`) |
+
+All outputs are written to `results/bulk/`.
+
+## Setup
+
+```{r setup}
+#| message: false
+#| warning: false
 library(tidyverse)
 library(DESeq2)
+library(apeglm)
 library(ComplexHeatmap)
-
 library(gprofiler2)
 library(correlationAnalyzeR)
 library(clusterProfiler)
-#library(xlsx)
-
+library(enrichplot)
+library(EnhancedVolcano)
+library(ggvenn)
 library(plotly)
-library(DOSE)
+library(htmlwidgets)
 
-GOBP_list <- getTERM2GENE(GSEA_Type = "GO:BP", Species = "mmusculus") 
-KEGG_list <- getTERM2GENE(GSEA_Type = "KEGG", Species = "mmusculus")
+# Paths
+data_dir    <- "data/bulk"
+results_dir <- "results/bulk"
+enrich_dir  <- file.path(results_dir, "enrichment")
+dir.create(enrich_dir, recursive = TRUE, showWarnings = FALSE)
 
+# Analysis parameters
+groups      <- c("Ctrl", "6_Hours", "1_Day", "3_Days")
+reference   <- "Ctrl"
+padj_cutoff <- 0.05
+lfc_cutoff  <- 1
 
+# Colours
+de_colours   <- c(UP = "#1D5B2D", DOWN = "#282973", NO = "grey")
+gsea_palette <- colorRampPalette(c("#35113C", "#282973", "#7C98AD", "#D3E5E2"))(99)
+
+set.seed(1)
+
+# MSigDB gene sets for GSEA
+GOBP_list <- getTERM2GENE(GSEA_Type = "GO:BP", Species = "mmusculus")
+KEGG_list <- getTERM2GENE(GSEA_Type = "KEGG",  Species = "mmusculus")
 ```
 
+## Load the data
 
-## PCA on FPKM
+```{r load-data}
+meta <- read.delim(file.path(data_dir, "studydesign2.xls"))
+meta$Treatment <- factor(meta$Treatment, levels = groups)
 
-### Load the Data 
+counts_raw <- read.delim(file.path(data_dir, "gene_count.xls"), row.names = "gene_id")
+gene_annot <- counts_raw[, c("gene_name", "gene_description")]
+counts     <- as.matrix(counts_raw[, meta$Sample])
 
-```{r Load the data}
-#metadata
-meta <- read.csv("../../data/Bulk/studydesign2.xls",sep = "\t")
-
-#FPKM data
-DATA <-read.delim("../../data/Bulk/gene_fpkm.xls", sep = "\t", header=TRUE, row.names = "gene_id")
-
-DATA <- DATA[, meta$Sample]
-
+fpkm <- read.delim(file.path(data_dir, "gene_fpkm.xls"), row.names = "gene_id")
+fpkm <- fpkm[, meta$Sample]
+fpkm <- fpkm[rowSums(fpkm) > 1, ]
+log_fpkm <- log2(fpkm + 1)
 ```
 
-#### Boxplot
+### Variance-stabilised counts
+
+All samples in one DESeq2 object, used for PCA and the heatmap. `blind = FALSE` lets the transformation use the experimental design, as recommended for downstream visualisation in the DESeq2 vignette.
+
+```{r vst}
+#| message: false
+dds_all <- DESeqDataSetFromMatrix(countData = counts, colData = meta, design = ~ Treatment)
+dds_all <- dds_all[rowSums(counts(dds_all) >= 10) >= 3, ]
+vsd <- vst(dds_all, blind = FALSE)
+```
+
+## Quality control
+
+### Expression distribution
 
 ```{r boxplot}
-
-
-DATA <- DATA[rowSums(DATA) > 1,] 
-
-#DATA <- DATA[rowSums(DATA >=10) >= 3,] 
-pdf("../../Results/BULK/Boxplot.pdf", width = 5, height = 6)
-boxplot( log2(DATA+1), las = 2,
-  main = "Original Log2 Ratios")
+pdf(file.path(results_dir, "Boxplot_log2FPKM.pdf"), width = 5, height = 6)
+boxplot(log_fpkm, las = 2, main = "log2(FPKM + 1)")
 dev.off()
 ```
 
+### PCA
 
-#### PCA
+```{r pca}
+# PCA on the 500 most variable genes, as in DESeq2::plotPCA()
+pca_df <- plotPCA(vsd, intgroup = "Treatment",  returnData = TRUE)
+var_explained <- round(100 * attr(pca_df, "percentVar"), 1)
+pca_df$Sample <- meta$SampleID[match(pca_df$name, meta$Sample)]
 
-```{r PCA}
-DATA.pca <- prcomp(t(log(DATA+1)), center = T)
-#DATA.pca <- prcomp(t(DATA), center = T)
-
-DATA.pca.sum <- as.data.frame(summary(DATA.pca)$importance)
-DATA.pca <- as.data.frame(DATA.pca$x)
-
-DATA.pca$Group <-meta$Treatment
-
-DATA.pca$Group <- factor(DATA.pca$Group, levels = unique(c("Ctrl", "6_Hours","1_Day", "3_Days")))
-
-DATA.pca$Sample <- rownames(DATA.pca)
-
-pdf("../../Results/BULK/PCA.pdf", width = 6,height = 5.6)
-  ggplot(as.data.frame(DATA.pca),
-  aes(x = PC1, y = PC2, colour = Group)
-  ) +
-  geom_point(shape=19, size=4, alpha = 0.7)+
-  geom_text(aes(label = Sample), position = position_jitter(width =2, height = 4)) +
+p_pca <- ggplot(pca_df, aes(PC1, PC2, colour = Treatment)) +
+  geom_point(size = 4, alpha = 0.7) +
+  geom_text(aes(label = Sample), vjust = -1, size = 3, show.legend = FALSE) +
   geom_hline(yintercept = 0, colour = "gray65", linetype = "dashed") +
   geom_vline(xintercept = 0, colour = "gray65", linetype = "dashed") +
-  ggtitle("PCA On Proteins") +
-  xlab(paste0("PC1 (",DATA.pca.sum$PC1[2]*100,"%)"))+
-  ylab(paste0("PC2 (",DATA.pca.sum$PC2[2]*100,"%)"))+
-  #ylab("PC3 2.1%")+
+  labs(title = "PCA on variance-stabilised counts (top 500 genes)",
+       x = paste0("PC1 (", var_explained[1], "%)"),
+       y = paste0("PC2 (", var_explained[2], "%)")) +
   theme_classic()
-dev.off()
+
+p_pca
+ggsave(file.path(results_dir, "PCA.pdf"), p_pca, width = 6, height = 5.6)
 ```
 
-## DEGs
-
-#### Condition 
-```{r Set the Condition}
-Con1 = "6_Hours"
-  #"Ctrl" 
-  #"6_Hours"
-  #"1_Day"
-  #"3_Days"
-
-Con2 = "Ctrl"
-  #"Ctrl" 
-  #"6_Hours"
-  #"1_Day"
-  #"3_Days"
-```
-
-```{r Load the data for DEG, echo=FALSE}
-#metadata
-meta <- read.csv("../../data/Bulk/studydesign2.xls",sep = "\t")
-
-#rowcount data
-DATA <-read.delim("../../data/Bulk/gene_count.xls", sep = "\t", header=TRUE, row.names = "gene_id")
-
-
-meta <- meta[which(meta$Treatment == Con1| meta$Treatment == Con2),]
-DATA <- DATA[, meta$Sample]
-
-print(paste0("Current Comparision is between ", Con1, " vs ", Con2, "!"))
-```
-
-```{r make a DESeq object}
-data <- DESeqDataSetFromMatrix(countData = DATA,
-                              colData = meta,
-                              design = ~ Treatment)
-
-data <- data[rowSums(counts(data)) > 1,]
-
-data <- DESeq(data)
-res <- results(data, contrast=c("Treatment",Con1,Con2))
-DATA.org <- read.delim("../../data/Bulk/gene_count.xls", sep = "\t", header=TRUE)
-res$gene_name<-DATA.org[match(sapply(strsplit(rownames(res),"\\."), function(x) x[1]), DATA.org$gene_id),"gene_name"]
-res$gene_des<-DATA.org[match(sapply(strsplit(rownames(res),"\\."), function(x) x[1]), DATA.org$gene_id),"gene_description"]
-res<-as.data.frame(res)
-```
-
-```{r Interactive Volcano Plot}
-
-res <- res %>%mutate(threshold_OE = padj <= 0.05 & abs(log2FoldChange) >= 1)
-
-res$diffexpressed <- "NO"
-res$diffexpressed[res$log2FoldChange > 1 & res$threshold_OE == TRUE] <- "UP"
-res$diffexpressed[res$log2FoldChange < -1 & res$threshold_OE == TRUE] <- "DOWN"
-table(res$diffexpressed)
-mycolors <- c("#282973","#1D5B2D",  "grey")
-  names(mycolors) <- c("DOWN", "UP", "NO")
-#if(interactive == T){
-  
-res$diffexpressed <- factor(res$diffexpressed, levels = c("NO", "UP", "DOWN"))
-l<-ggplotly(
-ggplot(res %>% arrange(match(diffexpressed, c( "NO","UP", "DOWN")))) +
-  aes(x = log2FoldChange, y = -log10(padj), colour = diffexpressed, text = gene_name)+
-  geom_point(size=2)+
-  scale_color_manual(values = mycolors)  +
-  geom_hline(yintercept = -log10(0.05), colour = "gray65", linetype = "dashed") +
-  geom_vline(xintercept = 1, colour = "gray65", linetype = "dashed") +
-  geom_vline(xintercept = -1, colour = "gray65", linetype = "dashed") +
-  labs(x = "log2 fold change",
-       y = "-log10 padj",
-       title = "Volcano Plot",
-       #subtitle = paste0( Condition1, "vs", Condition2),
-       caption=paste0("produced on ", Sys.time())) +
-  theme_classic()) %>% layout(title = list(text = paste0('VolcanoPlots',
-                                    '<br>',
-                                    '<sup>',
-                                     paste0(Con1, " vs " ,Con2, "   P_adj < 0.05 & abs(LogFC) >= 1"),
-                                    '</sup>')), 
-        hoverlabel=list(bgcolor="white") )
-
-htmlwidgets::saveWidget(l, paste0("../../Results/BULK/", Con1, "_vs_", Con2, "Vol_inter.html"))
-```
-
-```{r Volcano Plot}
-pdf(paste0("../../Results/BULK/", Con1, "_vs_", Con2, "_Vol.pdf"), width = 4, height = 4)
-res = arrange(res, desc(-pvalue))
-ggplot(res) +
-  geom_point(aes(x = log2FoldChange, y = -log10(padj), colour = diffexpressed), size = 2)+
-  scale_color_manual(values = mycolors)  + xlim(-5,3.5)+
-  #geom_text_repel(data=res[res$diffexpressed != "NO",][0:20,], aes(x = log2FoldChange, y = -log10(padj)), label= res$gene_name[res$diffexpressed != "NO"][0:20] )+
-  geom_hline(yintercept = -log10(0.05), colour = "gray65", linetype = "dashed") +
-  geom_vline(xintercept = 1, colour = "gray65", linetype = "dashed") +
-  geom_vline(xintercept = -1, colour = "gray65", linetype = "dashed") +
-  labs(x = "log2 fold change",
-       y = "-log10 padj",
-       title = "Volcano Plot",
-       subtitle = paste0( Con1, " vs ", Con2, "   P_adj<0.05 & abs(LogFC)>= 1"),
-       caption=paste0("produced on ", Sys.time())) +
-  theme_classic()
-dev.off()
-```
-
-```{r}
-
-
-diffexpressed <- ifelse(
-    res$log2FoldChange > 1 & res$threshold_OE == TRUE, '#1D5B2D',
-    ifelse(
-      res$log2FoldChange < 1 & res$threshold_OE == TRUE, "#282973",
-        'grey'))
-diffexpressed[is.na(diffexpressed)] <- "grey"
-names(diffexpressed)[diffexpressed == "#1D5B2D"] <- "UP"
-names(diffexpressed)[diffexpressed == "#282973"] <- "DOWN"
-names(diffexpressed)[diffexpressed == "grey"] <- "no Sig"
-```
-
-##### Customized Volcano
-
-```{r Customized Volcano}
-pdf(paste0("../../Results/BULK/", Con1, "_vs_", Con2, "_Vol.pdf"), width = 4, height = 4)
-EnhancedVolcano(res, 
-                x ="log2FoldChange", 
-                y = "padj" , 
-                subtitle = paste0( Con1, " vs ", Con2, "   P_adj < 0.05 & abs(LogFC) >= 1"),
-                selectLab = c("Gng4", "Gbp2", "Eomes", "Lgr5", "Apold1", "Capn11", "Cxcl10","Shox2", "Ifi44","Ccl7"),
-                lab = res$gene_name, 
-                pCutoff = 0.05,
-                colAlpha = 0.8,
-                pointSize = 1,
-                ylab = bquote(~-Log[10] ~ italic(Padj)),
-                drawConnectors = T,
-                widthConnectors = 0.4,
-                colConnectors = 'black',
-                boxedLabels = T,
-                labSize = 2,
-                colCustom = diffexpressed
-                #col = c("grey","grey","#1D5B2D")
-                ) + 
-  theme_classic() +
-  theme(legend.title=element_blank())
-dev.off()
-```
-
-Here I save the gene name for Vennes Graph
-
-```{r Keep Data for Vennes Graph}
-DEG_up <- list()
-DEG_down <- list()
-DEG <- list()
-
-
-DEG_up[[paste0(Con1,"_vs_", Con2)]]  <- as.character(res[res$diffexpressed == "UP",]$gene_name)
-DEG_down[[paste0(Con1,"_vs_", Con2)]]  <- as.character(res[res$diffexpressed == "DOWN",]$gene_name)
-DEG[[paste0(Con1,"_vs_", Con2)]]  <- as.character(res[res$diffexpressed != "NO",]$gene_name)
-```
-
-```{r}
-write.csv(as.data.frame(res),paste0("../../Results/BULK/",Con1,"_vs_",Con2,".csv" ))
-
-```
-
-
-##### Gene Ontology
-
-```{r}
-
-
-
-go = gost(res$gene_name[res$diffexpressed =="UP"], organism = 'mmusculus')
-
-write.csv(go$result[,3:11],paste0("../../Results/BULK/Enrichment/",Con1,"_vs_",Con2,".csv"))
-
-htmlwidgets::saveWidget(as_widget(assign(paste0("plot", i), gostplot(go,interactive = T)%>% layout(title = paste0("Cluster ", i)))), paste0("Cluster ",i," GO.html"))
-
-```
-
-##### GSEA
-
-```{r}
-geneList = list()
-
-res_slfc<-lfcShrink(data, coef =  "Treatment_Ctrl_vs_6_Hours")
-res_slfc$gene_name<-DATA.org[match(sapply(strsplit(rownames(res),"\\."), function(x) x[1]), DATA.org$gene_id),"gene_name"]
-res_slfc$gene_des<-DATA.org[match(sapply(strsplit(rownames(res),"\\."), function(x) x[1]), DATA.org$gene_id),"gene_description"]
-
-geneList <- -res_slfc$log2FoldChange
-names(geneList)=res_slfc$gene_name
-
-geneList=sort(geneList,decreasing = T) 
-
-
-GOBP <-GSEA(geneList, TERM2GENE =GOBP_list, 
-            #scoreType = "pos",
-            #pAdjustMethod = "BY",
-            pvalueCutoff = 1)
-write.csv(GOBP@result,paste0("../../Results/BULK/Enrichment/",Con1,"_vs_",Con2,"_gsea.csv"))
-
-KEGG <-GSEA(geneList, TERM2GENE =KEGG_list, 
-            #scoreType = "pos",
-            #pAdjustMethod = "BY",
-            pvalueCutoff = 1)
-
-write.csv(KEGG@result,paste0("../../Results/BULK/Enrichment/",Con1,"_vs_",Con2,"_gsea_KEGG.csv"))
-```
-
-#### Venn Diagram
-```{r}
-library(ggVennDiagram)
-
-pdf("../../Results/BULK/Venn_UP.pdf", width = 8, height = 5)
-ggvenn(DEG_up, fill_color = c("#282973","#1D5B2D","#0E99B2"),fill_alpha = 0.65, set_name_size = 4, stroke_size = 0.5, text_size = 3) + ggtitle("Upregulated Genes")
-dev.off()
-
-pdf("../../Results/BULK/Venn_DOWN.pdf", width = 8, height = 5)
-ggvenn(DEG_down, fill_color = c("#282973","#1D5B2D","#0E99B2"),fill_alpha = 0.65, set_name_size = 4, stroke_size = 0.5, text_size = 3) + ggtitle("Upregulated Genes")
-dev.off()
-
-```
-
-#### Save common gene list
-
-```{r}
-library(gplots)
-
-venn_up <- attr(venn(DEG_up),"intersections")
-
-venn_up2 <- as.data.frame(matrix(c(venn_up, rep(220, length(venn_up) %% 220)), 220))
-
-venn_down <- venn(DEG_down)
-
-```
-
-```{r}
-
-venn_up <- attr(venn(DEG_up),"intersections")
-write_csv(data.frame(
-  `1_Day_vs_Ctrl:3_Days_vs_Ctrl` = venn_up$`1_Day_vs_Ctrl:3_Days_vs_Ctrl`,
-  `6_Hours_vs_Ctrl:1_Day_vs_Ctrl` = c(venn_up$`6_Hours_vs_Ctrl:1_Day_vs_Ctrl`, rep(NA, length(venn_up$`1_Day_vs_Ctrl:3_Days_vs_Ctrl`) - length(venn_up$`6_Hours_vs_Ctrl:1_Day_vs_Ctrl`))),
-  `6_Hours_vs_Ctrl:3_Days_vs_Ctrl` = c(venn_up$`6_Hours_vs_Ctrl:3_Days_vs_Ctrl`, rep(NA, length(venn_up$`1_Day_vs_Ctrl:3_Days_vs_Ctrl`) - length(venn_up$`6_Hours_vs_Ctrl:3_Days_vs_Ctrl`))),
-  `6_Hours_vs_Ctrl:1_Day_vs_Ctrl:3_Days_vs_Ctrl` = c(venn_up$`6_Hours_vs_Ctrl:1_Day_vs_Ctrl:3_Days_vs_Ctrl`, rep(NA, length(venn_up$`1_Day_vs_Ctrl:3_Days_vs_Ctrl`) - length(venn_up$`6_Hours_vs_Ctrl:1_Day_vs_Ctrl:3_Days_vs_Ctrl`)))
-  ),"../../Results/BULK/Venn_up.csv")
-
-venn_down <- attr(venn(DEG_down),"intersections")
-write_csv(data.frame(
-  `1_Day_vs_Ctrl:3_Days_vs_Ctrl` = venn_down$`1_Day_vs_Ctrl:3_Days_vs_Ctrl`,
-  `6_Hours_vs_Ctrl:1_Day_vs_Ctrl` = c(venn_down$`6_Hours_vs_Ctrl:1_Day_vs_Ctrl`, rep(NA, length(venn_down$`1_Day_vs_Ctrl:3_Days_vs_Ctrl`) - length(venn_down$`6_Hours_vs_Ctrl:1_Day_vs_Ctrl`))),
-  `6_Hours_vs_Ctrl:1_Day_vs_Ctrl:3_Days_vs_Ctrl` = c(venn_down$`6_Hours_vs_Ctrl:1_Day_vs_Ctrl:3_Days_vs_Ctrl`, rep(NA, length(venn_down$`1_Day_vs_Ctrl:3_Days_vs_Ctrl`) - length(venn_down$`6_Hours_vs_Ctrl:1_Day_vs_Ctrl:3_Days_vs_Ctrl`)))
-  ),"../../Results/BULK/Venn_down.csv")
-
-```
-
-## Plot interested genes
-
-#### FPKM
-
-```{r}
-meta <- read.csv("../../data/Bulk/studydesign2.xls",sep = "\t")
-
-#FPKM data
-DATA <-read.delim("../../data/Bulk/gene_fpkm.xls", sep = "\t", header=TRUE, row.names = "gene_id")
-
-DATA <- DATA[, meta$Sample]
-DATA <- DATA[rowSums(DATA) > 1,] 
-DATA <- log2(DATA+1)
-DATA.org <- read.delim("../../data/Bulk/gene_count.xls", sep = "\t", header=TRUE)
-DATA$gene_name<-DATA.org[match(sapply(strsplit(rownames(DATA),"\\."), function(x) x[1]), DATA.org$gene_id),"gene_name"]
-
-data <- DATA[DATA$gene_name == "Arg1",]
-row.names(data) <- data$gene_name
-data$gene_name<- NULL
-data<-as.data.frame(t(data))
-data$Group <-meta$Treatment
-
-data$Group <- factor(data$Group, levels = unique(c("Ctrl", "6_Hours","1_Day", "3_Days")))
-
-data$Sample <- rownames(data)
-
-
-
-    ggplotly(
-      ggplot(d)+ aes(x = Group, y = Arg1, color = Group, label = rownames(data)) + 
-        geom_boxplot()+
-        
-        geom_point(position=position_jitter(w = 0.1,h = 0)) +
-        #geom_text_repel(aes(label = rownames(d)), max.overlaps = Inf) + 
-        theme_bw() +
-        ggtitle(genename) +
-        theme(plot.title = element_text(hjust = 0.5),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)))%>%
-      layout(hoverlabel=list(bgcolor="white"))
-
-pdf("../../Results/BULK/Arg1.pdf", width = 5, height = 3)   
-  ggplot(data)+ aes(x = Group, y = Arg1, color = Group) + 
-    geom_line(data =  aggregate(Arg1 ~ Group, data = data, mean), color = "azure3", group = 1)+
-    geom_boxplot(staplewidth = 0.2, width = 0.3)+ 
-    geom_point(position=position_jitter(w = 0.1,h = 0)) +
-  #geom_text_repel(aes(label = rownames(d)), max.overlaps = Inf) + 
+## Differential expression
+
+### Functions
+
+Each time point is compared with Ctrl in a separate DESeq2 model fitted on those two groups only.
+
+```{r de-functions}
+run_deseq <- function(con1, con2 = reference) {
+  coldata <- droplevels(meta[meta$Treatment %in% c(con1, con2), ])
+  coldata$Treatment <- relevel(coldata$Treatment, ref = con2)
+
+  dds <- DESeqDataSetFromMatrix(countData = counts[, coldata$Sample],
+                                colData   = coldata,
+                                design    = ~ Treatment)
+  dds <- dds[rowSums(counts(dds)) > 1, ]
+  dds <- DESeq(dds)
+
+  res <- as.data.frame(results(dds, contrast = c("Treatment", con1, con2)))
+  res$gene_name <- gene_annot[rownames(res), "gene_name"]
+  res$gene_des  <- gene_annot[rownames(res), "gene_description"]
+  res$diffexpressed <- case_when(
+    padj <= padj_cutoff & log2FoldChange >  lfc_cutoff ~ "UP",
+    padj <= padj_cutoff & log2FoldChange < -lfc_cutoff ~ "DOWN",
+    TRUE ~ "NO"
+  ) %>% factor(levels = c("NO", "UP", "DOWN"))
+
+  list(dds = dds, res = res)
+}
+
+threshold_label <- paste0("padj < ", padj_cutoff, " & |log2FC| > ", lfc_cutoff)
+
+plot_volcano <- function(res, title, xlim = NULL) {
+  ggplot(arrange(res, diffexpressed),   # significant genes drawn on top
+         aes(log2FoldChange, -log10(padj), colour = diffexpressed, text = gene_name)) +
+    geom_point(size = 1.75) +
+    scale_colour_manual(values = de_colours) +
+    geom_hline(yintercept = -log10(padj_cutoff), colour = "gray65", linetype = "dashed") +
+    geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), colour = "gray65", linetype = "dashed") +
+    coord_cartesian(xlim = xlim) +
+    labs(x = "log2 fold change", y = "-log10 padj",
+         title = "Volcano plot", subtitle = paste0(title, "   ", threshold_label)) +
+    theme_classic()
+}
+
+plot_volcano_labelled <- function(res, title, label_genes, xlim = NULL) {
+  status <- as.character(res$diffexpressed)
+  key_colours <- de_colours[status]
+  names(key_colours) <- c(UP = "UP", DOWN = "DOWN", NO = "Not sig.")[status]
+
+  p <- EnhancedVolcano(res,
+                       x = "log2FoldChange", y = "padj",
+                       lab = res$gene_name, selectLab = label_genes,
+                       title = "Volcano plot",
+                       subtitle = paste0(title, "   ", threshold_label),
+                       caption = NULL,
+                       pCutoff = padj_cutoff, FCcutoff = lfc_cutoff,
+                       colCustom = key_colours, colAlpha = 0.8, pointSize = 1,
+                       ylab = bquote(~ -Log[10] ~ italic(Padj)),
+                       drawConnectors = TRUE, widthConnectors = 0.4, colConnectors = "black",
+                       boxedLabels = TRUE, labSize = 2) +
     theme_classic() +
-    ylab("Log2(FPKM+1)")+
-    ggtitle("Arg1") +
-    theme(plot.title = element_text(hjust = 0.5),axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
-dev.off()
+    theme(legend.title = element_blank())
+  if (!is.null(xlim)) p <- p + coord_cartesian(xlim = xlim)
+  p
+}
 
+run_gsea <- function(dds, con1, con2 = reference) {
+  shrunk <- lfcShrink(dds, coef = paste0("Treatment_", con1, "_vs_", con2), type = "apeglm")
 
+  ranks <- setNames(shrunk$log2FoldChange, gene_annot[rownames(shrunk), "gene_name"])
+  ranks <- ranks[!is.na(ranks) & !is.na(names(ranks)) & names(ranks) != ""]
+  ranks <- ranks[order(abs(ranks), decreasing = TRUE)]
+  ranks <- ranks[!duplicated(names(ranks))]   # keep the strongest entry per gene name
+  ranks <- sort(ranks, decreasing = TRUE)
+
+  list(
+    GOBP = GSEA(ranks, TERM2GENE = GOBP_list, pvalueCutoff = 1, seed = TRUE),
+    KEGG = GSEA(ranks, TERM2GENE = KEGG_list, pvalueCutoff = 1, seed = TRUE)
+  )
+}
 ```
 
-#### DESeq2 Counts
+### Comparisons
 
-```{r}
-meta <- read.csv("../../data/Bulk/studydesign2.xls",sep = "\t")
+Genes to label on the volcano plots, axis limits, and gene sets shown in the GSEA dot plots for each comparison.
 
-#rowcount data
-DATA <-read.delim("../../data/Bulk/gene_count.xls", sep = "\t", header=TRUE, row.names = "gene_id")
-DATA.org <- read.delim("../../data/Bulk/gene_count.xls", sep = "\t", header=TRUE)
+```{r comparisons}
+comparisons <- list(
+  "6_Hours" = list(
+    label_genes = c("Gng4", "Gbp2", "Eomes", "Lgr5", "Apold1", "Capn11", "Cxcl10",
+                    "Shox2", "Ifi44", "Ccl7"),
+    xlim = c(-5, 3.5),
+    gobp_terms = NULL,
+    kegg_terms = NULL
+  ),
+  "1_Day" = list(
+    label_genes = c("Gng4", "Egr3", "Fmo2", "Meis2", "Syt6", "C4b", "H19", "Tnc",
+                    "Col3a1", "Cfh", "Ccr2", "Saa3", "Ly6c2", "Lyz2", "Ccl2"),
+    xlim = c(-3.5, 5.5),
+    gobp_terms = c("GOBP_LEUKOCYTE_MEDIATED_IMMUNITY", "GOBP_PHAGOCYTOSIS",
+                   "GOBP_CYTOKINE_MEDIATED_SIGNALING_PATHWAY", "GOBP_WOUND_HEALING",
+                   "GOBP_T_CELL_ACTIVATION", "GOBP_GRANULOCYTE_MIGRATION",
+                   "GOBP_MYELOID_LEUKOCYTE_MIGRATION", "GOBP_T_CELL_PROLIFERATION"),
+    kegg_terms = "KEGG_LEUKOCYTE_TRANSENDOTHELIAL_MIGRATION"
+  ),
+  "3_Days" = list(
+    label_genes = c("Lyz2", "H2-Aa", "H2-Eb1", "Eln", "Col3a1", "Ccr2", "Ccl22",
+                    "Clec7a", "Il1b", "Ccl2", "Top2a", "Ccl12", "S100a5", "Gng4",
+                    "Alas2", "Zbtb16", "Slco5a1"),
+    xlim = c(-7, 7),
+    gobp_terms = c("GOBP_CYTOKINE_MEDIATED_SIGNALING_PATHWAY",
+                   "GOBP_ACTIVATION_OF_IMMUNE_RESPONSE", "GOBP_PHAGOCYTOSIS",
+                   "GOBP_CELLULAR_RESPONSE_TO_INTERFERON_GAMMA",
+                   "GOBP_RESPONSE_TO_CHEMOKINE", "GOBP_REGULATION_OF_T_CELL_PROLIFERATION",
+                   "GOBP_ANTIGEN_PROCESSING_AND_PRESENTATION", "GOBP_GRANULOCYTE_MIGRATION"),
+    kegg_terms = "KEGG_LEUKOCYTE_TRANSENDOTHELIAL_MIGRATION"
+  )
+)
+```
 
+### Run all comparisons
 
-DATA <- DATA[, meta$Sample]
+```{r run-comparisons}
+#| message: false
+#| warning: false
+DEG_up   <- list()
+DEG_down <- list()
 
-DATA <- DATA[rowSums(data >= 10) >= 3, ]
+for (con1 in names(comparisons)) {
+  cfg  <- comparisons[[con1]]
+  name <- paste0(con1, "_vs_", reference)
+  message("Running ", name)
 
-data <- DESeqDataSetFromMatrix(countData = DATA,
-                              colData = meta,
-                              design = ~ Treatment)
+  de  <- run_deseq(con1)
+  res <- de$res
+  print(table(res$diffexpressed))
+  write.csv(res, file.path(results_dir, paste0(name, "_DESeq2.csv")))
 
-data <- data[rowSums(counts(data) >= 10) >= 3, ]
+  # Volcano plots
+  p_vol <- plot_volcano(res, paste0(con1, " vs ", reference), cfg$xlim)
+  ggsave(file.path(results_dir, paste0(name, "_volcano.pdf")), p_vol, width = 4, height = 4)
+  saveWidget(ggplotly(p_vol, tooltip = c("text", "x", "y")),
+             file.path(results_dir, paste0(name, "_volcano_interactive.html")),
+             selfcontained = TRUE)
 
-data <- DESeq(data)
+  p_vol_lab <- plot_volcano_labelled(res, paste0(con1, " vs ", reference),
+                                     cfg$label_genes, cfg$xlim)
+  ggsave(file.path(results_dir, paste0(name, "_volcano_labelled.pdf")), p_vol_lab,
+         width = 4, height = 4)
 
-sizeFactors(data)
-data.nor <- counts(data, normalized=TRUE)
-#data.nor$gene_name<-DATA.org[match(sapply(strsplit(rownames(data.nor),"\\."), function(x) x[1]), DATA.org$gene_id),"gene_name"]
-list <- unique(c("Il11", "Il1b", "Tgfb1", "Tnfsf10", "Tnfsf8",  "Ccl2", "Ccl6", "Ccl7", "Ccl8", "Ccl9", "Ccl12", "Ccl22", "Cxcl9","Cxcl10","Cxcl16","Ccr1","Ccr2", "Ccr5", "Ccr7",  "Csf2rb", "Csf2rb2",  "Ccl2",  "Ccl12", "Ccl22",  "Cxcl10",  "Ccr2", "Csf2rb", "Csf2rb2", "Lyz2",  "Tnfsf10", "Il1b")) 
+  # Gene lists for the Venn diagrams
+  DEG_up[[name]]   <- na.omit(res$gene_name[res$diffexpressed == "UP"])
+  DEG_down[[name]] <- na.omit(res$gene_name[res$diffexpressed == "DOWN"])
 
-#data.nor$gene_name <- DATA.org[match(sapply(strsplit(rownames(data.nor),"\\."), function(x) x[1]), DATA.org$gene_id),"gene_name"]
+  # Over-representation analysis of upregulated genes (g:Profiler)
+  go <- gost(DEG_up[[name]], organism = "mmusculus")
+  if (!is.null(go)) {
+    go$result %>%
+      select(term_id, source, term_name, p_value, term_size, query_size,
+             intersection_size, precision, recall) %>%
+      write.csv(file.path(enrich_dir, paste0(name, "_gprofiler_UP.csv")), row.names = FALSE)
+  }
 
-list_id <-DATA.org[match(sapply(list, function(x) x[1]), DATA.org$gene_name),"gene_id"]
+  # GSEA on shrunken fold changes
+  gsea <- run_gsea(de$dds, con1)
+  write.csv(gsea$GOBP@result, file.path(enrich_dir, paste0(name, "_GSEA_GOBP.csv")))
+  write.csv(gsea$KEGG@result, file.path(enrich_dir, paste0(name, "_GSEA_KEGG.csv")))
 
-data_nor_gene <- data.nor[list_id,] %>% as.data.frame()
-data_nor_gene$gene_name <- DATA.org[match(sapply(strsplit(rownames(data_nor_gene),"\\."), function(x) x[1]), DATA.org$gene_id),"gene_name"]
-rownames(data_nor_gene) <- data_nor_gene$gene_name
-data_nor_gene$gene_name <- NULL
+  if (!is.null(cfg$gobp_terms)) {
+    p <- dotplot(gsea$GOBP, x = "NES", showCategory = cfg$gobp_terms,
+                 title = paste("GSEA GO:BP", con1, "vs", reference)) +
+      scale_fill_gradientn(colours = gsea_palette)
+    ggsave(file.path(enrich_dir, paste0(name, "_GSEA_GOBP.pdf")), p, width = 6, height = 6)
+  }
+  if (!is.null(cfg$kegg_terms)) {
+    p <- dotplot(gsea$KEGG, showCategory = cfg$kegg_terms,
+                 title = paste("GSEA KEGG", con1, "vs", reference)) +
+      xlim(0.08, 0.23) +
+      scale_fill_gradientn(colours = gsea_palette)
+    ggsave(file.path(enrich_dir, paste0(name, "_GSEA_KEGG.pdf")), p, width = 7, height = 6)
+  }
+}
+```
 
- colnames(data_nor_gene) <- meta$SampleID
+## Overlap between time points
 
+```{r venn}
+venn_colours <- c("#282973", "#1D5B2D", "#0E99B2")
+
+p_up <- ggvenn(DEG_up, fill_color = venn_colours, fill_alpha = 0.65,
+               set_name_size = 4, stroke_size = 0.5, text_size = 3) +
+  ggtitle("Upregulated genes")
+p_down <- ggvenn(DEG_down, fill_color = venn_colours, fill_alpha = 0.65,
+                 set_name_size = 4, stroke_size = 0.5, text_size = 3) +
+  ggtitle("Downregulated genes")
+
+ggsave(file.path(results_dir, "Venn_UP.pdf"),   p_up,   width = 8, height = 5)
+ggsave(file.path(results_dir, "Venn_DOWN.pdf"), p_down, width = 8, height = 5)
+
+# Genes in every region of the Venn diagram, one row per gene
+venn_table <- function(deg_list) {
+  regions <- attr(gplots::venn(deg_list, show.plot = FALSE), "intersections")
+  imap_dfr(regions, ~ tibble(region = .y, gene_name = .x))
+}
+write.csv(venn_table(DEG_up),   file.path(results_dir, "Venn_UP_genes.csv"),   row.names = FALSE)
+write.csv(venn_table(DEG_down), file.path(results_dir, "Venn_DOWN_genes.csv"), row.names = FALSE)
+```
+
+## Selected genes
+
+### Immune genes heatmap (variance-stabilised counts, row z-scores)
+
+```{r heatmap}
+vst_mat <- assay(vsd)
+
+immune_genes <- unique(c("Il11", "Il1b", "Tgfb1", "Tnfsf10", "Tnfsf8", "Ccl2", "Ccl6", "Ccl7",
+                         "Ccl8", "Ccl9", "Ccl12", "Ccl22", "Cxcl9", "Cxcl10", "Cxcl16", "Ccr1",
+                         "Ccr2", "Ccr5", "Ccr7", "Csf2rb", "Csf2rb2", "Lyz2"))
+
+gene_ids <- rownames(gene_annot)[match(immune_genes, gene_annot$gene_name)]
+gene_ids <- gene_ids[!is.na(gene_ids) & gene_ids %in% rownames(vst_mat)]
+
+# Order samples by time point so columns and annotation stay aligned
+sample_order <- order(meta$Treatment)
+mat <- vst_mat[gene_ids, meta$Sample[sample_order]]
+rownames(mat) <- gene_annot[gene_ids, "gene_name"]
+colnames(mat) <- meta$SampleID[sample_order]
+mat_scaled <- t(scale(t(mat)))
+
+ht <- Heatmap(mat_scaled,
+              name = "Relative expression",
+              cluster_rows = FALSE, cluster_columns = FALSE,
+              top_annotation = HeatmapAnnotation(Treatment = meta$Treatment[sample_order]),
+              column_title = "Regulation of immune system process",
+              row_names_side = "left")
+draw(ht)
+
+pdf(file.path(results_dir, "Heatmap_immune_genes.pdf"), width = 7, height = 6)
+draw(ht)
+dev.off()
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
 ```

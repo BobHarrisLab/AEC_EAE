@@ -1,0 +1,608 @@
+---
+title: "snRNA-seq of brain border tissue: basic analysis"
+format: html
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+## Introduction
+
+Single-nucleus RNA-seq (10x On-Chip Multiplexing; GEO: GSE301590) of brain border tissue from control mice and mice 1 and 4 days after AEC injection (n = 4 per time point). Ambient RNA was removed with CellBender before this analysis.
+
+Workflow:
+
+1.  Per-sample quality control and doublet detection (scDblFinder)
+2.  Integration across samples (rliger iNMF; Harmony and RPCA for comparison)
+3.  Annotation of major cell types, then subclustering of immune cells, fibroblasts and epithelial cells
+4.  Removal of neuronal contamination (Fgf14⁺ nuclei in non-neural clusters) and re-integration
+5.  Cell-type proportions and differential expression between time points
+
+Cell–cell communication (CellChat, NicheNet) is in `02_advanced_analysis.qmd`, which starts from the objects saved here.
+
+**Input files**
+
+| File | Content |
+|----|----|
+| `data/snrna/cellbender/<sample>/cellbender_raw_feature_bc_matrix_filtered.h5` | CellBender output, one folder per sample (`Ctrl1`–`Ctrl4`, `D1_1`–`D1_4`, `D4_1`–`D4_4`) |
+
+Outputs are written to `results/snrna/`; intermediate Seurat objects to `results/snrna/objects/`.
+
+## Setup
+
+```{r setup}
+library(Seurat)
+library(tidyverse)
+library(cowplot)
+library(patchwork)
+library(scCustomize)        # Read_CellBender_h5_Mat()
+library(scDblFinder)
+library(SingleCellExperiment)
+library(gprofiler2)
+library(rliger)
+library(ggalluvial)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Mm.eg.db)
+library(ComplexHeatmap)
+library(tidydr)
+
+# Paths
+cellbender_dir <- "data/snrna/cellbender"
+results_dir    <- "results/snrna"
+obj_dir        <- file.path(results_dir, "objects")
+qc_dir         <- file.path(results_dir, "qc")
+for (d in c(results_dir, obj_dir, qc_dir,
+            file.path(results_dir, c("annotation", "condition")))) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+set.seed(42)
+
+qc_features <- c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo",
+                 "percent_hb", "percent_plat", "S.Score", "G2M.Score")
+regress_vars <- c("nCount_RNA", "percent_mito", "percent_ribo", "S.Score", "G2M.Score")
+```
+
+### Samples and QC thresholds
+
+QC thresholds were set per sample after inspecting the QC plots; the expected doublet rate depends on the number of nuclei recovered per sample.
+
+```{r samples}
+samples <- tribble(
+  ~folder, ~sample_id, ~group, ~min_features, ~max_mito, ~max_ribo, ~doublet_rate,
+  "Ctrl1", "Ctrl_1",   "Ctrl", 100,           10,         7,         0.04,
+  "Ctrl2", "Ctrl_2",   "Ctrl", 100,            5,         5,         0.04,
+  "Ctrl3", "Ctrl_3",   "Ctrl", 100,           10,         7.5,       0.07,
+  "Ctrl4", "Ctrl_4",   "Ctrl", 100,           12,        12,         0.08,
+  "D1_1",  "D1_1",     "D1",   300,           10,         8,         0.02,
+  "D1_2",  "D1_2",     "D1",   100,           10,         6,         0.03,
+  "D1_3",  "D1_3",     "D1",   100,           18,        12,         0.08,
+  "D1_4",  "D1_4",     "D1",   100,           10,         7,         0.08,
+  "D4_1",  "D4_1",     "D4",   100,           10,         5,         0.03,
+  "D4_2",  "D4_2",     "D4",   100,            9,         6,         0.03,
+  "D4_3",  "D4_3",     "D4",   100,           10,         5,         0.05,
+  "D4_4",  "D4_4",     "D4",   100,           12,         8,         0.08
+)
+knitr::kable(samples)
+```
+
+## Per-sample quality control
+
+```{r qc-functions}
+# Mouse orthologues of the Seurat cell-cycle genes
+cc_genes <- list(
+  s   = gorth(cc.genes.updated.2019$s.genes,   source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name,
+  g2m = gorth(cc.genes.updated.2019$g2m.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+)
+
+plot_top_genes <- function(obj, file, n = 20) {
+  counts <- LayerData(obj, assay = "RNA", layer = "counts")
+  counts@x <- counts@x / rep.int(Matrix::colSums(counts), diff(counts@p)) * 100
+  top <- order(Matrix::rowSums(counts), decreasing = TRUE)[n:1]
+  pdf(file, width = 12, height = 6)
+  boxplot(as.matrix(Matrix::t(counts[top, ])), cex = 0.1, las = 1,
+          xlab = "Percent of counts per nucleus",
+          col = scales::hue_pal()(n)[n:1], horizontal = TRUE)
+  dev.off()
+}
+
+preprocess_sample <- function(s) {
+  message("Processing ", s$sample_id)
+  counts <- Read_CellBender_h5_Mat(file.path(cellbender_dir, s$folder,
+                                             "cellbender_raw_feature_bc_matrix_filtered.h5"))
+  obj <- CreateSeuratObject(counts, project = "AEC_border", min.cells = 3, min.features = 100)
+  obj$SampleID <- s$sample_id
+  obj$Group    <- s$group
+
+  obj <- PercentageFeatureSet(obj, "^mt-",         col.name = "percent_mito")
+  obj <- PercentageFeatureSet(obj, "^Rp[sl]",      col.name = "percent_ribo")
+  obj <- PercentageFeatureSet(obj, "^Hb[^(p|e|s)]", col.name = "percent_hb")
+  obj <- PercentageFeatureSet(obj, "Pecam1|Pf4",   col.name = "percent_plat")
+  obj <- NormalizeData(obj)
+  obj <- CellCycleScoring(obj, s.features = cc_genes$s, g2m.features = cc_genes$g2m)
+
+  p <- VlnPlot(obj, features = qc_features, group.by = "SampleID",
+               pt.size = 0.01, alpha = 0.1, ncol = 4) & NoLegend()
+  ggsave(file.path(qc_dir, paste0(s$folder, "_QC_raw.pdf")), p, width = 10, height = 6)
+  plot_top_genes(obj, file.path(qc_dir, paste0(s$folder, "_top20_genes.pdf")))
+
+  n_before <- ncol(obj)
+  obj <- subset(obj, subset = nFeature_RNA > s$min_features &
+                              percent_mito < s$max_mito &
+                              percent_ribo < s$max_ribo)
+  message("  ", n_before, " -> ", ncol(obj), " nuclei after QC")
+
+  # Doublet detection on raw counts
+  set.seed(42)
+  sce <- scDblFinder(as.SingleCellExperiment(obj), dbr = s$doublet_rate)
+  obj$scDblFinder.class <- sce$scDblFinder.class
+  obj$scDblFinder.score <- sce$scDblFinder.score
+  obj
+}
+```
+
+```{r run-qc}
+obj_list <- lapply(seq_len(nrow(samples)), function(i) preprocess_sample(samples[i, ]))
+
+DATA <- merge(obj_list[[1]], obj_list[-1],
+              add.cell.ids = samples$folder, project = "AEC_border")
+rm(obj_list)
+
+table(DATA$scDblFinder.class, DATA$SampleID)
+
+DATA <- subset(DATA, subset = scDblFinder.class == "singlet")
+DATA <- JoinLayers(DATA)
+DATA$SampleID <- factor(DATA$SampleID, levels = samples$sample_id)
+DATA$Group    <- factor(DATA$Group, levels = c("Ctrl", "D1", "D4"))
+
+p <- VlnPlot(DATA, features = qc_features, group.by = "SampleID",
+             pt.size = 0, ncol = 4) & NoLegend()
+ggsave(file.path(qc_dir, "QC_all_samples_singlets.pdf"), p, width = 14, height = 8)
+
+saveRDS(DATA, file.path(obj_dir, "01_merged_singlets.rds"))
+```
+
+## Integration
+
+Samples are integrated with rliger (iNMF), which is used for clustering and the main UMAPs. Harmony and RPCA embeddings are computed for comparison; Harmony is also used to subcluster epithelial cells.
+
+```{r functions-integration}
+run_seurat_integration <- function(obj, methods = c("harmony", "rpca")) {
+  obj <- JoinLayers(obj)
+  obj[["RNA"]] <- split(obj[["RNA"]], f = obj$SampleID)
+  obj <- NormalizeData(obj)
+  obj <- FindVariableFeatures(obj)
+  obj <- ScaleData(obj, vars.to.regress = regress_vars)
+  obj <- RunPCA(obj, npcs = 50)
+  obj <- RunUMAP(obj, reduction = "pca", dims = 1:50, reduction.name = "umap.unintegrated")
+
+  if ("harmony" %in% methods) {
+    obj <- IntegrateLayers(obj, method = HarmonyIntegration,
+                           orig.reduction = "pca", new.reduction = "harmony")
+    obj <- RunUMAP(obj, reduction = "harmony", dims = 1:50, reduction.name = "umap.harmony")
+  }
+  if ("rpca" %in% methods) {
+    obj <- IntegrateLayers(obj, method = RPCAIntegration,
+                           orig.reduction = "pca", new.reduction = "rpca")
+    obj <- RunUMAP(obj, reduction = "rpca", dims = 1:50, reduction.name = "umap.rpca")
+  }
+  JoinLayers(obj)
+}
+
+# iNMF with rliger; the factor loadings are added to the Seurat object as reduction "inmf"
+run_inmf <- function(obj, k = 30) {
+  obj[["RNA"]] <- split(obj[["RNA"]], f = obj$SampleID)
+  lig <- as.liger(obj, assay = "RNA", organism = "mouse")
+  lig <- removeMissing(lig, minFeatures = 100)
+  lig <- rliger::normalize(lig)
+  lig <- selectGenes(lig, nGenes = 1000)
+  lig <- scaleNotCenter(lig)
+  lig <- runIntegration(lig, k = k)
+  lig <- alignFactors(lig, method = "centroidAlign")
+
+  emb <- Embeddings(ligerToSeurat(lig), "inmf")
+  obj <- JoinLayers(obj)
+  if (all(rownames(emb) %in% colnames(obj))) {
+    obj <- subset(obj, cells = rownames(emb))
+    emb <- emb[colnames(obj), ]
+  } else {
+    # rliger renamed the cells; it keeps them in the same order as the input object
+    stopifnot(nrow(emb) == ncol(obj))
+    rownames(emb) <- colnames(obj)
+  }
+  obj[["inmf"]] <- CreateDimReducObject(embeddings = emb, key = "iNMF_", assay = "RNA")
+  obj
+}
+
+cluster_leiden <- function(obj, reduction, dims, k, resolutions) {
+  obj <- FindNeighbors(obj, reduction = reduction, dims = dims, k.param = k)
+  for (res in resolutions) {
+    obj <- FindClusters(obj, graph.name = "RNA_snn", algorithm = 4, group.singletons = TRUE,
+                        resolution = res, cluster.name = paste0("Leiden_", res))
+  }
+  obj
+}
+
+plot_resolutions <- function(obj, reduction, resolutions, file) {
+  plots <- lapply(resolutions, function(res) {
+    DimPlot(obj, reduction = reduction, group.by = paste0("Leiden_", res), label = TRUE) +
+      ggtitle(paste0("Leiden ", res)) + NoLegend()
+  })
+  ggsave(file, wrap_plots(plots, ncol = 2), width = 12, height = 4 * ceiling(length(plots) / 2))
+}
+
+# Positive markers ranked by a combined score of significance, fold change and detection difference
+rank_markers <- function(obj, group_by) {
+  FindAllMarkers(obj, group.by = group_by, assay = "RNA", only.pos = TRUE,
+                 logfc.threshold = 0.1, min.pct = 0.1, min.diff.pct = 0.2,
+                 max.cells.per.ident = 1000) %>%
+    dplyr::filter(p_val_adj < 0.05) %>%
+    mutate(pct.diff = pct.1 - pct.2,
+           combined_score = -log10(p_val_adj) * abs(avg_log2FC) * abs(pct.diff),
+           combined_score = ifelse(is.infinite(combined_score),
+                                   max(combined_score[is.finite(combined_score)]),
+                                   combined_score)) %>%
+    arrange(cluster, desc(combined_score))
+}
+
+annotate_clusters <- function(obj, cluster_col, labels) {
+  names(labels) <- as.character(seq_along(labels))
+  unname(labels[as.character(obj[[cluster_col, drop = TRUE]])])
+}
+
+umap_theme <- function() {
+  theme_classic() +
+    theme_dr(xlength = 0.22, ylength = 0.22,
+             arrow = grid::arrow(length = unit(0.15, "inches"), type = "closed")) +
+    theme(panel.grid = element_blank())
+}
+```
+
+```{r integration}
+DATA <- run_seurat_integration(DATA)
+DATA <- run_inmf(DATA)
+DATA <- RunUMAP(DATA, reduction = "inmf", dims = 1:30, min.dist = 0.3, reduction.name = "umap.inmf")
+
+p <- wrap_plots(
+  DimPlot(DATA, reduction = "umap.unintegrated", group.by = "SampleID", shuffle = TRUE) + ggtitle("Unintegrated"),
+  DimPlot(DATA, reduction = "umap.harmony",      group.by = "SampleID", shuffle = TRUE) + ggtitle("Harmony"),
+  DimPlot(DATA, reduction = "umap.rpca",         group.by = "SampleID", shuffle = TRUE) + ggtitle("RPCA"),
+  DimPlot(DATA, reduction = "umap.inmf",         group.by = "SampleID", shuffle = TRUE) + ggtitle("iNMF"),
+  ncol = 2)
+ggsave(file.path(qc_dir, "Integration_comparison.pdf"), p, width = 14, height = 10)
+
+saveRDS(DATA, file.path(obj_dir, "02_integrated.rds"))
+```
+
+## Major cell types
+
+```{r major-clusters}
+resolutions <- c(0.1, 0.25, 0.5, 0.75, 1, 1.5, 2)
+DATA <- cluster_leiden(DATA, reduction = "inmf", dims = 1:30, k = 25, resolutions = resolutions)
+plot_resolutions(DATA, "umap.inmf", resolutions,
+                 file.path(results_dir, "annotation", "Major_clusters_resolutions.pdf"))
+
+markers_major <- rank_markers(DATA, "Leiden_0.25")
+write.csv(markers_major, file.path(results_dir, "annotation", "Major_cluster_markers.csv"), row.names = FALSE)
+
+DotPlot(DATA, group.by = "Leiden_0.25",
+        features = c("Mobp", "Mag", "Ptprc", "Tmem119", "Col3a1", "Col1a1", "Olig2", "Tnr",
+                     "Rbfox3", "Grin2b", "Aqp4", "Gfap", "Pecam1", "Adgrl4", "Sox6", "Slc35f1",
+                     "Dnah12", "Ccdc162", "Mpz", "Pmp22", "Abcc9", "Cald1", "Pdgfrb", "Kcnj8",
+                     "Rgs5", "Foxj1", "Ttr", "Krt8", "Krt18", "Otx2", "Aqp1", "Folr1", "Mrc1",
+                     "Cx3cr1", "Cd3d", "Cd3e", "Cd19", "Alox15", "Top2a", "Mki67", "Acta2")) +
+  coord_flip()
+```
+
+```{r major-annotation}
+celltype_levels <- c("Epithelial Cells", "Fibroblasts", "Endothelial Cells", "SMCs",
+                     "Ependymal Cells", "Immune Cells", "Neuron", "Astrocytes",
+                     "Oligo/Schwann cells", "Pinealocytes")
+
+# Leiden_0.25 clusters 1-19
+DATA$Celltypes <- annotate_clusters(DATA, "Leiden_0.25", c(
+  "Epithelial Cells", "Epithelial Cells", "Epithelial Cells", "Fibroblasts",
+  "Fibroblasts", "Epithelial Cells", "Neuron", "Epithelial Cells",
+  "Epithelial Cells", "Immune Cells", "Fibroblasts", "Neuron",
+  "Endothelial Cells", "Pinealocytes", "Astrocytes", "Oligo/Schwann cells",
+  "Fibroblasts", "Immune Cells", "Epithelial Cells"))
+DATA$Subtypes <- DATA$Celltypes   # refined below for immune cells, fibroblasts and epithelial cells
+```
+
+## Subclustering
+
+The subtype labels are written back to the full object; clusters that turn out to belong to another lineage update `Celltypes` as well.
+
+### Immune cells
+
+```{r immune}
+immune <- subset(DATA, subset = Celltypes == "Immune Cells")
+immune <- cluster_leiden(immune, reduction = "inmf", dims = 1:30, k = 15,
+                         resolutions = c(0.25, 0.5, 0.75, 1))
+plot_resolutions(immune, "umap.inmf", c(0.25, 0.5, 0.75, 1),
+                 file.path(results_dir, "annotation", "Immune_clusters_resolutions.pdf"))
+
+# Leiden_0.5 clusters 6 and 8 are not immune cells and are removed from the dataset
+removed_immune <- colnames(immune)[immune$Leiden_0.5 %in% c("6", "8")]
+immune <- subset(immune, cells = removed_immune, invert = TRUE)
+
+immune <- cluster_leiden(immune, reduction = "inmf", dims = 1:30, k = 15,
+                         resolutions = c(0.25, 0.5, 0.75, 1))
+plot_resolutions(immune, "umap.inmf", c(0.25, 0.5, 0.75, 1),
+                 file.path(results_dir, "annotation", "Immune_clusters_refined.pdf"))
+
+# Leiden_0.75 clusters 1-11
+immune$Subtypes <- annotate_clusters(immune, "Leiden_0.75", c(
+  "Ccr2+ Macrophages", "Ccr2- Macrophages", "T Cells", "Ccr2+ Monocytes",
+  "Ccr2+ Monocytes", "Ccr2- Macrophages", "Osteoclast", "Ccr2- Macrophages",
+  "S100a8+ Cells", "cDendritic Cells", "ILCs/NK Cells"))
+
+DATA <- subset(DATA, cells = removed_immune, invert = TRUE)
+DATA@meta.data[colnames(immune), "Subtypes"] <- immune$Subtypes
+```
+
+### Fibroblasts
+
+```{r fibroblasts}
+fb <- subset(DATA, subset = Celltypes == "Fibroblasts")
+fb <- cluster_leiden(fb, reduction = "inmf", dims = 1:30, k = 15,
+                     resolutions = c(0.25, 0.5, 0.75, 1))
+plot_resolutions(fb, "umap.inmf", c(0.25, 0.5, 0.75, 1),
+                 file.path(results_dir, "annotation", "Fibroblast_clusters_resolutions.pdf"))
+
+# Leiden_0.5 clusters 1-13
+fb$Subtypes <- annotate_clusters(fb, "Leiden_0.5", c(
+  "Dural Fibroblast", "Leptomeningeal Fibroblast", "Arachnoid Fibroblasts",
+  "Periosteal Fibroblast", "Leptomeningeal Fibroblast", "Dural Fibroblast",
+  "Periosteal Fibroblast", "Choroid plexus Fibroblast", "SMCs",
+  "Arachnoid Barrier Cells", "Dural Fibroblast", "Ependymal Cells", "Neuron"))
+
+DATA@meta.data[colnames(fb), "Subtypes"] <- fb$Subtypes
+moved <- colnames(fb)[fb$Subtypes %in% c("SMCs", "Ependymal Cells", "Neuron")]
+DATA@meta.data[moved, "Celltypes"] <- fb@meta.data[moved, "Subtypes"]
+```
+
+### Epithelial cells
+
+```{r epithelia}
+epi <- subset(DATA, subset = Celltypes == "Epithelial Cells")
+epi <- cluster_leiden(epi, reduction = "harmony", dims = 1:30, k = 15,
+                      resolutions = c(0.1, 0.25, 0.5))
+plot_resolutions(epi, "umap.inmf", c(0.1, 0.25, 0.5),
+                 file.path(results_dir, "annotation", "Epithelial_clusters_resolutions.pdf"))
+
+markers_epi <- rank_markers(epi, "Leiden_0.25")
+DotPlot(epi, group.by = "Leiden_0.25",
+        features = rev(unique(group_by(markers_epi, cluster) %>% slice_head(n = 5) %>% pull(gene)))) +
+  coord_flip()
+
+# Leiden_0.25 clusters 1-9
+epi$Subtypes <- annotate_clusters(epi, "Leiden_0.25", c(
+  "Cuboidal Epithelial Cells", "Cuboidal Epithelial Cells", "Multicilia Epithelial Cells",
+  "Multicilia Epithelial Cells", "Cuboidal Epithelial Cells", "T Cells",
+  "OB Epithelium", "Ependymal Cells", "ILCs/NK Cells"))
+
+DATA@meta.data[colnames(epi), "Subtypes"] <- epi$Subtypes
+DATA@meta.data[colnames(epi)[epi$Subtypes %in% c("T Cells", "ILCs/NK Cells")], "Celltypes"] <- "Immune Cells"
+DATA@meta.data[colnames(epi)[epi$Subtypes == "Ependymal Cells"], "Celltypes"] <- "Ependymal Cells"
+```
+
+## Remove neuronal contamination and re-integrate
+
+Nuclei with high *Fgf14* expression outside the neural clusters are treated as contamination from brain parenchyma and removed. The remaining nuclei are integrated again; cell-type labels are kept.
+
+```{r fgf14}
+VlnPlot(DATA, features = "Fgf14", group.by = "SampleID", pt.size = 0) +
+  geom_hline(yintercept = 0.35, linetype = "dashed")
+
+neural <- c("Neuron", "Pinealocytes", "Ependymal Cells", "Astrocytes")
+fgf14  <- FetchData(DATA, vars = "Fgf14", layer = "data")$Fgf14
+contaminated <- colnames(DATA)[fgf14 > 0.35 & !DATA$Celltypes %in% neural]
+table(DATA$Celltypes[contaminated])
+
+DATA <- subset(DATA, cells = contaminated, invert = TRUE)
+```
+
+```{r reintegration}
+DATA <- run_seurat_integration(DATA, methods = "harmony")
+DATA <- run_inmf(DATA)
+DATA <- RunUMAP(DATA, reduction = "inmf", dims = 1:30, min.dist = 0.3, reduction.name = "umap.inmf")
+```
+
+## Final object
+
+```{r final-object}
+subtype_levels <- c(
+  "Cuboidal Epithelial Cells", "Multicilia Epithelial Cells", "Ependymal Cells", "OB Epithelium",
+  "Dural Fibroblast", "Leptomeningeal Fibroblast", "Arachnoid Fibroblasts", "Arachnoid Barrier Cells",
+  "Choroid plexus Fibroblast", "Periosteal Fibroblast", "SMCs", "Endothelial Cells",
+  "Ccr2- Macrophages", "Ccr2+ Monocytes", "Ccr2+ Macrophages", "T Cells", "cDendritic Cells",
+  "Osteoclast", "ILCs/NK Cells", "S100a8+ Cells",
+  "Neuron", "Oligo/Schwann cells", "Pinealocytes", "Astrocytes")
+
+DATA$Celltypes <- factor(DATA$Celltypes, levels = celltype_levels)
+DATA$Subtypes  <- factor(DATA$Subtypes,  levels = subtype_levels)
+stopifnot(!anyNA(DATA$Celltypes), !anyNA(DATA$Subtypes))
+
+DATA$Condition <- ifelse(DATA$Group == "Ctrl", "PBS", "AEC")
+
+saveRDS(DATA, file.path(obj_dir, "03_annotated.rds"))
+
+# Cell annotations, for deposition with the processed data
+DATA@meta.data %>%
+  rownames_to_column("cell") %>%
+  dplyr::select(cell, SampleID, Group, Celltypes, Subtypes) %>%
+  write.csv(file.path(results_dir, "cell_annotations.csv"), row.names = FALSE)
+```
+
+```{r final-figures}
+p <- DimPlot(DATA, reduction = "umap.inmf", group.by = "Celltypes",
+             alpha = 0.6, pt.size = 0.1, shuffle = TRUE, raster = FALSE) + umap_theme()
+ggsave(file.path(results_dir, "annotation", "Celltypes_full.pdf"), p, width = 16, height = 10, dpi = 600)
+
+p <- DotPlot(DATA, group.by = "Celltypes",
+             features = rev(c("Kl", "Kcnj13", "Col1a2", "Lama2", "Pecam1", "Adgrl4", "Acta2", "Myh11",
+                              "Ccdc162", "Dnah12", "Ptprc", "Lyn", "Rbfox3", "Grin2b", "Aqp4", "Gfap",
+                              "Mog", "Mobp", "Mpz", "Pmp22", "Casz1", "Cngb3"))) +
+  coord_flip() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(file.path(results_dir, "annotation", "Celltype_markers_full.pdf"), p, width = 5, height = 6)
+
+markers_celltypes <- rank_markers(DATA, "Celltypes")
+write.csv(markers_celltypes, file.path(results_dir, "annotation", "Celltype_markers.csv"), row.names = FALSE)
+```
+
+## Cell-type proportions
+
+Neural cell types (parenchymal contamination) are excluded.
+
+```{r proportion-functions}
+plot_proportions <- function(meta, var, name) {
+  props <- meta %>%
+    dplyr::count(Group, .data[[var]]) %>%
+    group_by(Group) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup()
+  write.csv(props, file.path(results_dir, "annotation", paste0("Proportions_", name, ".csv")), row.names = FALSE)
+
+  p <- ggplot(props, aes(x = Group, y = prop, fill = .data[[var]])) +
+    geom_alluvium(aes(alluvium = .data[[var]]), alpha = 0.7, colour = "black") +
+    scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+    labs(x = NULL, y = "Proportion of nuclei", fill = NULL) +
+    cowplot::theme_minimal_hgrid() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(file.path(results_dir, "annotation", paste0("Proportions_", name, ".pdf")), p, width = 10, height = 7)
+
+  p
+}
+```
+
+```{r proportions-celltypes}
+border <- subset(DATA, subset = Celltypes %in% c("Neuron", "Pinealocytes", "Oligo/Schwann cells", "Astrocytes"),
+                 invert = TRUE)
+border$Celltypes <- droplevels(border$Celltypes)
+border$Subtypes  <- droplevels(border$Subtypes)
+border <- RunUMAP(border, reduction = "inmf", dims = 1:30, reduction.name = "umap.inmf")
+
+p <- DimPlot(border, reduction = "umap.inmf", group.by = "Celltypes",
+             alpha = 0.6, pt.size = 0.1, shuffle = TRUE, raster = FALSE) + umap_theme()
+ggsave(file.path(results_dir, "annotation", "Celltypes_clean.pdf"), p, width = 16, height = 10, dpi = 600)
+
+p <- DotPlot(border, group.by = "Celltypes",
+             features = rev(c("Clic6", "Kcnj13", "Col1a2", "Lama2", "Pecam1", "Adgrl4", "Acta2", "Myh11",
+                              "Ccdc162", "Dnah12", "Ptprc", "Ly86"))) +
+  coord_flip() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(file.path(results_dir, "annotation", "Celltype_markers_clean.pdf"), p, width = 5, height = 5.5)
+
+plot_proportions(border@meta.data, "Celltypes", "Celltypes")
+
+# Border cells only, used by the advanced analysis
+saveRDS(border, file.path(obj_dir, "04_border_cells.rds"))
+```
+
+### Subtypes of immune cells, fibroblasts and epithelial cells
+
+```{r subtype-figures}
+subtype_figures <- function(celltype, name, markers, umap_dims = 1:30, min_dist = 0.3) {
+  obj <- subset(border, subset = Celltypes == celltype)
+  obj$Subtypes <- droplevels(obj$Subtypes)
+  obj <- RunUMAP(obj, reduction = "inmf", dims = umap_dims, min.dist = min_dist,
+                 metric = "euclidean", reduction.name = "umap.inmf")
+
+  p <- DimPlot(obj, reduction = "umap.inmf", group.by = "Subtypes",
+               alpha = 0.8, pt.size = 1, shuffle = TRUE, raster = FALSE) + umap_theme()
+  ggsave(file.path(results_dir, "annotation", paste0(name, "_subtypes.pdf")), p, width = 8, height = 5, dpi = 600)
+
+  write.csv(rank_markers(obj, "Subtypes"),
+            file.path(results_dir, "annotation", paste0(name, "_subtype_markers.csv")), row.names = FALSE)
+
+  p <- DotPlot(obj, group.by = "Subtypes", features = rev(unique(markers))) +
+    coord_flip() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(file.path(results_dir, "annotation", paste0(name, "_subtype_markers.pdf")), p, width = 5, height = 5.5)
+
+  plot_proportions(obj@meta.data, "Subtypes", name)
+  invisible(obj)
+}
+
+subtype_figures("Immune Cells", "Immune",
+                c("Mrc1", "Maf", "Ccr2", "Ly6c2", "Adgre1", "S100a9", "Cxcr2", "Atp6v0d2",
+                  "Ctsk", "Ciita", "Zbtb46", "Cd247", "Cd3e", "Ccl1", "Xcl1"))
+subtype_figures("Fibroblasts", "Fibroblasts",
+                c("Slc47a1", "Slc26a7", "Il34", "Slc7a11", "Crabp2", "Aldh1a2", "Wnt6",
+                  "Dpp4", "Cldn11", "Dpep1", "Inmt", "Runx2", "Satb2"))
+subtype_figures("Epithelial Cells", "Epithelial",
+                c("Folr1", "Aqp1", "Otx2", "Gmnc", "Glis3", "Spag16"),
+                umap_dims = 1:25)
+```
+
+## Changes over time
+
+### Genes changed in each cell type
+
+Genes higher at each time point than in the other time points, per cell type.
+
+```{r condition-celltypes}
+for (ct in levels(border$Celltypes)) {
+  obj <- subset(border, subset = Celltypes == ct)
+  markers <- rank_markers(obj, "Group")
+  if (nrow(markers) == 0) next
+  write.csv(markers, file.path(results_dir, "condition", paste0("Group_markers_", ct, ".csv")), row.names = FALSE)
+
+  top5 <- markers %>% group_by(cluster) %>% slice_head(n = 5) %>% pull(gene)
+  p <- DotPlot(obj, features = unique(rev(top5)), group.by = "Group") + coord_flip()
+  ggsave(file.path(results_dir, "condition", paste0("Group_markers_", ct, ".pdf")), p, width = 6, height = 7, dpi = 600)
+}
+```
+
+### D1 vs Ctrl per subtype, with GSEA
+
+```{r condition-subtypes}
+gsea_terms <- c("response to external biotic stimulus", "response to other organism",
+                "biological process involved in interspecies interaction between organisms",
+                "response to stress", "cytokine production", "regulation of innate immune response",
+                "granulocyte migration", "myeloid leukocyte migration", "regulation of chemokine production",
+                "granulocyte chemotaxis", "leukocyte activation involved in immune response",
+                "interleukin-1 beta production", "response to interferon-beta")
+
+for (st in levels(border$Subtypes)) {
+  n_d1   <- sum(border$Subtypes == st & border$Group == "D1")
+  n_ctrl <- sum(border$Subtypes == st & border$Group == "Ctrl")
+  if (min(n_d1, n_ctrl) < 20) {
+    message("Skipping ", st, ": too few nuclei (D1 ", n_d1, ", Ctrl ", n_ctrl, ")"); next
+  }
+  obj <- subset(border, subset = Subtypes == st & Group %in% c("D1", "Ctrl"))
+  Idents(obj) <- "Group"
+
+  # All genes, so that GSEA ranks the whole transcriptome
+  de <- FindMarkers(obj, ident.1 = "D1", ident.2 = "Ctrl", logfc.threshold = 0, min.pct = 0.05) %>%
+    rownames_to_column("gene")
+  write.csv(de, file.path(results_dir, "condition", paste0("D1_vs_Ctrl_", st, ".csv")), row.names = FALSE)
+
+  sig <- dplyr::filter(de, p_val_adj < 0.05)
+  message(st, ": ", nrow(sig), " DEGs")
+  if (nrow(sig) > 0) {
+    top <- sig %>% group_by(up = avg_log2FC > 0) %>% slice_max(abs(avg_log2FC), n = 5) %>% pull(gene)
+    p <- DotPlot(obj, features = unique(rev(top)), group.by = "Group") + coord_flip()
+    ggsave(file.path(results_dir, "condition", paste0("D1_vs_Ctrl_", st, ".pdf")), p, width = 6, height = 7, dpi = 600)
+  }
+
+  ranks <- sort(setNames(de$avg_log2FC, de$gene), decreasing = TRUE)
+  gse <- gseGO(ranks, ont = "ALL", OrgDb = org.Mm.eg.db, keyType = "SYMBOL",
+               by = "fgsea", eps = 0, seed = TRUE)
+  write.csv(gse@result, file.path(results_dir, "condition", paste0("D1_vs_Ctrl_", st, "_GSEA.csv")), row.names = FALSE)
+
+  shown <- intersect(gsea_terms, gse@result$Description[gse@result$p.adjust < 0.05])
+  if (length(shown) > 0) {
+    p <- dotplot(gse, showCategory = shown, x = "NES") + ggtitle(paste(st, "GSEA, D1 vs Ctrl"))
+    ggsave(file.path(results_dir, "condition", paste0("D1_vs_Ctrl_", st, "_GSEA.pdf")), p, width = 6, height = 7, dpi = 600)
+  }
+}
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```
+

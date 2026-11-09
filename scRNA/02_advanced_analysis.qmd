@@ -1,0 +1,563 @@
+---
+title: "snRNA-seq of brain border tissue: advanced analysis"
+format: html
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+## Introduction
+
+Cell–cell communication between brain border cells (snRNA-seq, GEO: GSE301590) and HG cells (scRNA-seq), in control mice and 1 or 4 days after AEC injection:
+
+1.  CellChat: communication in PBS (Ctrl) and AEC-treated mice (D1 or D4), and how it changes
+2.  NicheNet: ligands that best explain the gene expression changes in HG cells at D4
+3.  Communication between the injected human AECs and the host cells, using a published human AEC scRNA-seq dataset
+
+**Input files**
+
+| File | Content |
+|----|----|
+| `results/snrna/objects/04_border_cells.rds` | Annotated border cells, saved by `01_basic_analysis.qmd` |
+| `data/snrna/hg_cells.rds` | Annotated HG cells from the scRNA-seq analysis (columns `Group` with `Ctrl`/`D1`/`D4`, `SampleID`, `Subtypes`), used as receivers |
+| `data/aec_reference/Epithelial_cells_subcluster*.xls` | Normalised expression of human amniotic epithelial cells from \[CITATION, ACCESSION\]; genes in rows, cells in columns |
+
+Outputs are written to `results/snrna/cellchat/`, `results/snrna/nichenet/` and `results/snrna/aec_host/`.
+
+## Setup
+
+```{r setup}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(ComplexHeatmap)
+library(CellChat)
+library(nichenetr)
+library(harmony)
+library(orthogene)
+
+results_dir <- "results/snrna"
+border_object <- file.path(results_dir, "objects", "04_border_cells.rds")
+hg_object     <- "data/snrna/hg_cells.rds"
+aec_dir       <- "data/aec_reference"
+for (d in file.path(results_dir, c("cellchat", "nichenet", "aec_host", "aec_host/pathways"))) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+set.seed(42)
+
+border <- readRDS(border_object)
+subtype_levels <- levels(border$Subtypes)
+```
+
+## Cell–cell communication (CellChat)
+
+Border cells are combined with the HG cells from the same time points. Communication is inferred separately in PBS (Ctrl) and AEC-treated mice (D1 or D4) and then compared. Osteoclasts are excluded.
+
+```{r cellchat-functions}
+hg <- readRDS(hg_object)
+hg_levels <- levels(factor(hg$Subtypes))
+
+communication_object <- function(timepoint) {
+  keep <- c("Epithelial Cells", "Fibroblasts", "Endothelial Cells", "Immune Cells",
+            "Ependymal Cells", "SMCs")
+  b <- subset(border, subset = Group %in% c("Ctrl", timepoint) &
+                               Celltypes %in% keep & Subtypes != "Osteoclast")
+  h <- subset(hg, subset = Group %in% c("Ctrl", timepoint))
+
+  obj <- JoinLayers(merge(b, h))
+  obj$Subtypes  <- droplevels(factor(obj$Subtypes, levels = c(subtype_levels, hg_levels)))
+  obj$Condition <- ifelse(obj$Group == "Ctrl", "PBS", "AEC")
+  obj$samples   <- obj$SampleID
+  NormalizeData(obj)
+}
+
+run_cellchat <- function(obj) {
+  labels <- droplevels(obj$Subtypes)
+  cc <- createCellChat(object = LayerData(obj, assay = "RNA", layer = "data"),
+                       meta = data.frame(group = labels, row.names = colnames(obj)),
+                       group.by = "group")
+  cc@DB <- CellChatDB.mouse
+  cc <- subsetData(cc)
+  cc <- identifyOverExpressedGenes(cc, do.fast = FALSE)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc)
+  cc <- filterCommunication(cc, min.cells = 20)
+  cc <- computeCommunProbPathway(cc)
+  cc <- netAnalysis_computeCentrality(cc, slot.name = "netP")
+  aggregateNet(cc)
+}
+
+compare_cellchat <- function(timepoint) {
+  out <- file.path(results_dir, "cellchat", timepoint)
+  dir.create(out, showWarnings = FALSE)
+
+  obj <- communication_object(timepoint)
+  cc_pbs <- run_cellchat(subset(obj, subset = Condition == "PBS"))
+  cc_aec <- run_cellchat(subset(obj, subset = Condition == "AEC"))
+
+  shared <- intersect(levels(cc_pbs@idents), levels(cc_aec@idents))
+  object.list <- list(PBS = subsetCellChat(cc_pbs, idents.use = shared),
+                      AEC = subsetCellChat(cc_aec, idents.use = shared))
+  object.list <- lapply(object.list, function(x) {
+    x@idents <- droplevels(x@idents)
+    x <- computeCommunProbPathway(x)
+    netAnalysis_computeCentrality(x, slot.name = "netP")
+  })
+  cellchat <- mergeCellChat(object.list, add.names = names(object.list))
+  cellchat <- netAnalysis_computeCentrality(cellchat)
+  saveRDS(list(PBS = cc_pbs, AEC = cc_aec, merged = cellchat), file.path(out, "cellchat_objects.rds"))
+
+  # Number and strength of interactions
+  pdf(file.path(out, "Interaction_number.pdf"), width = 6, height = 3)
+  print(compareInteractions(cellchat, show.legend = FALSE, group = c(1, 2)) +
+        compareInteractions(cellchat, show.legend = FALSE, group = c(1, 2), measure = "weight"))
+  dev.off()
+
+  pdf(file.path(out, "Interaction_change.pdf"), width = 10, height = 6)
+  netVisual_diffInteraction(cellchat, weight.scale = TRUE, top = 0.5)
+  netVisual_diffInteraction(cellchat, weight.scale = TRUE, measure = "weight", top = 0.5)
+  dev.off()
+
+  pdf(file.path(out, "Interaction_change_heatmap.pdf"), width = 7, height = 6)
+  draw(netVisual_heatmap(cellchat))
+  draw(netVisual_heatmap(cellchat, measure = "weight"))
+  dev.off()
+
+  # Sender and receiver roles
+  num.link <- sapply(object.list, function(x) rowSums(x@net$count) + colSums(x@net$count) - diag(x@net$count))
+  gg <- lapply(names(object.list), function(n) {
+    netAnalysis_signalingRole_scatter(object.list[[n]], title = n,
+                                      weight.MinMax = c(min(num.link), max(num.link)))
+  })
+  ggsave(file.path(out, "Source_Target.pdf"), wrap_plots(gg), width = 15, height = 7)
+
+  # Pathways that differ between conditions
+  ggsave(file.path(out, "Pathway_ranking.pdf"),
+         rankNet(cellchat, mode = "comparison", measure = "weight", stacked = TRUE, do.stat = TRUE) +
+         rankNet(cellchat, mode = "comparison", measure = "weight", stacked = FALSE, do.stat = TRUE),
+         width = 12, height = 10)
+
+  # Selected pathways
+  pdf(file.path(out, "Pathways.pdf"), width = 15, height = 10)
+  for (pw in c("COLLAGEN", "LAMININ", "TGFb", "FN1", "CXCL", "CCL", "CD45")) {
+    if (!all(sapply(object.list, function(x) pw %in% x@netP$pathways))) next
+    weight.max <- getMaxWeight(object.list, slot.name = "netP", attribute = pw)
+    par(mfrow = c(1, 2), xpd = TRUE)
+    for (n in names(object.list)) {
+      netVisual_aggregate(object.list[[n]], signaling = pw, layout = "circle",
+                          edge.weight.max = weight.max[1], edge.width.max = 10,
+                          signaling.name = paste(pw, n))
+    }
+  }
+  dev.off()
+
+  # Signals sent by Ccr2+ monocytes and macrophages
+  ccr2 <- intersect(c("Ccr2+ Monocytes", "Ccr2+ Macrophages"), shared)
+  for (pw in c("TGFb", "FN1", "CCL")) {
+    if (!all(sapply(object.list, function(x) pw %in% x@netP$pathways))) next
+    weight.max <- getMaxWeight(object.list, slot.name = "netP", attribute = pw)
+    pdf(file.path(out, paste0(pw, "_from_Ccr2_cells.pdf")), width = 15, height = 10)
+    par(mfrow = c(1, 2), xpd = TRUE)
+    for (n in names(object.list)) {
+      netVisual_aggregate(object.list[[n]], signaling = pw, sources.use = ccr2, layout = "circle",
+                          edge.weight.max = weight.max[1], edge.width.max = 10,
+                          signaling.name = paste(pw, n))
+    }
+    dev.off()
+  }
+
+  # Signalling changes per cell type
+  pdf(file.path(out, "Signaling_changes_per_celltype.pdf"), width = 10, height = 6)
+  for (ct in shared) print(netAnalysis_signalingChanges_scatter(cellchat, idents.use = ct))
+  dev.off()
+
+  # Outgoing signalling in AEC-treated mice
+  pathways <- union(object.list$PBS@netP$pathways, object.list$AEC@netP$pathways)
+  pdf(file.path(out, "Outgoing_signaling_AEC.pdf"), width = 10, height = 20)
+  draw(netAnalysis_signalingRole_heatmap(object.list$AEC, pattern = "outgoing",
+                                         signaling = intersect(pathways, object.list$AEC@netP$pathways),
+                                         title = "AEC", width = 5, height = 6))
+  dev.off()
+
+  # Signals sent and received by S100a8+ cells in AEC-treated mice
+  if ("S100a8+ Cells" %in% levels(cc_aec@idents)) {
+    pdf(file.path(out, "S100a8_source.pdf"), width = 13, height = 10)
+    netVisual_chord_gene(cc_aec, sources.use = "S100a8+ Cells", lab.cex = 0.5, legend.pos.y = 30)
+    dev.off()
+    pdf(file.path(out, "S100a8_target.pdf"), width = 13, height = 10)
+    netVisual_chord_gene(cc_aec, targets.use = "S100a8+ Cells", lab.cex = 0.5, legend.pos.y = 30)
+    dev.off()
+  }
+
+  invisible(list(PBS = cc_pbs, AEC = cc_aec, merged = cellchat))
+}
+```
+
+```{r cellchat-d1}
+cc_d1 <- compare_cellchat("D1")
+```
+
+```{r cellchat-d4}
+cc_d4 <- compare_cellchat("D4")
+
+# Signals sent to and received by HG_2 cells in AEC-treated mice (D4)
+out <- file.path(results_dir, "cellchat", "D4")
+pdf(file.path(out, "HG_2_source.pdf"), width = 13, height = 10)
+netVisual_chord_gene(cc_d4$AEC, sources.use = "HG_2", lab.cex = 0.5, legend.pos.y = 30)
+dev.off()
+pdf(file.path(out, "HG_2_target.pdf"), width = 13, height = 10)
+netVisual_chord_gene(cc_d4$AEC, targets.use = "HG_2", lab.cex = 0.5, legend.pos.y = 30)
+dev.off()
+
+# Ligand-receptor pairs reaching HG_2 through Ccr3, and CCL/CXCL signalling to HG_2
+pairs_ccr3 <- subsetCommunication(cc_d4$AEC) %>%
+  dplyr::filter(receptor == "Ccr3") %>%
+  dplyr::distinct(interaction_name)
+p <- netVisual_bubble(cc_d4$AEC, targets.use = "HG_2", pairLR.use = pairs_ccr3,
+                      angle.x = 90, remove.isolate = FALSE, title.name = "Ccr3 signalling received by HG_2")
+ggsave(file.path(out, "HG_2_Ccr3_bubble.pdf"), p, width = 13, height = 8)
+
+pairs_chemokine <- extractEnrichedLR(cc_d4$AEC, signaling = c("CCL", "CXCL"))
+p <- netVisual_bubble(cc_d4$AEC, targets.use = "HG_2", pairLR.use = pairs_chemokine, remove.isolate = TRUE)
+ggsave(file.path(out, "HG_2_CCL_CXCL_bubble.pdf"), p, width = 10, height = 8)
+
+pdf(file.path(out, "Signaling_roles_AEC.pdf"), width = 13, height = 10)
+draw(netAnalysis_signalingRole_heatmap(cc_d4$AEC, pattern = "outgoing") +
+     netAnalysis_signalingRole_heatmap(cc_d4$AEC, pattern = "incoming"))
+dev.off()
+```
+
+## Ligand activity in HG cells (NicheNet)
+
+Which ligands best explain the genes that change in HG cells in AEC-treated mice (D4) compared with PBS? HG subtypes are the receivers; potential ligands are those whose receptors are expressed in HG cells.
+
+```{r nichenet}
+obj <- communication_object("D4")
+Idents(obj) <- "Subtypes"
+
+# NicheNet v2 mouse networks (Zenodo record 7074291)
+lr_network <- readRDS(url("https://zenodo.org/record/7074291/files/lr_network_mouse_21122021.rds")) %>%
+  distinct(from, to)
+ligand_target_matrix <- readRDS(url("https://zenodo.org/record/7074291/files/ligand_target_matrix_nsga2r_final_mouse.rds"))
+weighted_networks    <- readRDS(url("https://zenodo.org/record/7074291/files/weighted_networks_nsga2r_final_mouse.rds"))
+
+receiver <- intersect(hg_levels, levels(Idents(obj)))
+expressed_genes_receiver <- get_expressed_genes(receiver, obj, pct = 0.1)
+expressed_receptors <- intersect(unique(lr_network$to), expressed_genes_receiver)
+potential_ligands   <- lr_network %>% dplyr::filter(to %in% expressed_receptors) %>% pull(from) %>% unique()
+
+de_receiver <- FindMarkers(subset(obj, idents = receiver), group.by = "Condition",
+                           ident.1 = "AEC", ident.2 = "PBS", min.pct = 0.05) %>%
+  rownames_to_column("gene")
+write.csv(de_receiver, file.path(results_dir, "nichenet", "HG_AEC_vs_PBS_DE.csv"), row.names = FALSE)
+
+background_expressed_genes <- intersect(expressed_genes_receiver, rownames(ligand_target_matrix))
+geneset_oi <- de_receiver %>%
+  dplyr::filter(p_val_adj < 0.05, abs(avg_log2FC) > 0.3) %>%
+  pull(gene) %>%
+  intersect(background_expressed_genes)
+message(length(geneset_oi), " target genes; ", length(background_expressed_genes), " background genes")
+
+ligand_activities <- predict_ligand_activities(geneset = geneset_oi,
+                                               background_expressed_genes = background_expressed_genes,
+                                               ligand_target_matrix = ligand_target_matrix,
+                                               potential_ligands = potential_ligands) %>%
+  arrange(-aupr_corrected) %>%
+  mutate(rank = rank(-aupr_corrected))
+write.csv(ligand_activities, file.path(results_dir, "nichenet", "Ligand_activities.csv"), row.names = FALSE)
+
+best_upstream_ligands <- ligand_activities %>% top_n(20, aupr_corrected) %>%
+  arrange(-aupr_corrected) %>% pull(test_ligand)
+```
+
+```{r nichenet-plots}
+vis_ligand_aupr <- ligand_activities %>%
+  dplyr::filter(test_ligand %in% best_upstream_ligands) %>%
+  column_to_rownames("test_ligand") %>%
+  dplyr::select(aupr_corrected) %>%
+  arrange(aupr_corrected) %>%
+  as.matrix(ncol = 1)
+p <- make_heatmap_ggplot(vis_ligand_aupr, "Prioritized ligands", "Ligand activity",
+                         legend_title = "AUPR", color = "darkorange") +
+  theme(axis.text.x.top = element_blank())
+ggsave(file.path(results_dir, "nichenet", "Ligand_activity.pdf"), p, width = 3, height = 6)
+
+# Ligand-target links
+active_ligand_target_links_df <- best_upstream_ligands %>%
+  lapply(get_weighted_ligand_target_links, geneset = geneset_oi,
+         ligand_target_matrix = ligand_target_matrix, n = 50) %>%
+  bind_rows() %>%
+  drop_na()
+active_ligand_target_links <- prepare_ligand_target_visualization(
+  ligand_target_df = active_ligand_target_links_df,
+  ligand_target_matrix = ligand_target_matrix, cutoff = 0.10)
+
+order_ligands <- intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% rev()
+order_targets <- active_ligand_target_links_df$target %>% unique() %>% intersect(rownames(active_ligand_target_links))
+p <- make_heatmap_ggplot(t(active_ligand_target_links[order_targets, order_ligands]),
+                         "Prioritized ligands", "Predicted target genes",
+                         color = "purple", legend_title = "Regulatory potential") +
+  scale_fill_gradient2(low = "whitesmoke", high = "purple")
+ggsave(file.path(results_dir, "nichenet", "Ligand_targets.pdf"), p,
+       width = max(8, 0.15 * length(order_targets)), height = 6, limitsize = FALSE)
+
+# Ligand-receptor links
+ligand_receptor_links_df <- get_weighted_ligand_receptor_links(
+  best_upstream_ligands, expressed_receptors, lr_network, weighted_networks$lr_sig)
+vis_ligand_receptor_network <- prepare_ligand_receptor_visualization(
+  ligand_receptor_links_df, best_upstream_ligands, order_hclust = "both")
+p <- make_heatmap_ggplot(t(vis_ligand_receptor_network), y_name = "Ligands", x_name = "Receptors",
+                         color = "mediumvioletred", legend_title = "Prior interaction potential")
+ggsave(file.path(results_dir, "nichenet", "Ligand_receptors.pdf"), p, width = 10, height = 6)
+```
+
+## Communication between AECs and host cells
+
+The injected AECs are human, so they are not captured in the mouse data. Their expression is taken from a published scRNA-seq dataset of human amniotic epithelial cells. Mouse genes are converted to human orthologues, and communication between AECs and the border and HG cells from AEC-treated mice is inferred with the human CellChat database.
+
+### Published human AEC data
+
+```{r aec-reference}
+aec_files <- file.path(aec_dir, c("Epithelial_cells_subcluster1-2.xls",
+                                  "Epithelial_cells_subcluster3-4.xls",
+                                  "Epithelial_cells_subcluster5-6.xls",
+                                  "Epithelial_cells_subcluster7-8-9-10.xls"))
+
+mats <- lapply(aec_files, function(f) {
+  Matrix::Matrix(as.matrix(read.delim(f, check.names = FALSE, row.names = "gene")), sparse = TRUE)
+})
+
+# Combine the tables on the union of genes
+all_genes <- Reduce(union, lapply(mats, rownames))
+mats <- lapply(mats, function(m) {
+  full <- Matrix::Matrix(0, nrow = length(all_genes), ncol = ncol(m), sparse = TRUE,
+                         dimnames = list(all_genes, colnames(m)))
+  full[rownames(m), ] <- m
+  full
+})
+norm_mat <- do.call(cbind, mats)
+
+# The tables hold normalised values, so they go into the "data" layer
+aec <- CreateSeuratObject(counts = Matrix::Matrix(0, nrow = nrow(norm_mat), ncol = ncol(norm_mat), sparse = TRUE,
+                                                  dimnames = dimnames(norm_mat)))
+aec <- SetAssayData(aec, assay = "RNA", layer = "data", new.data = norm_mat)
+aec$SampleID <- sub("_[^_]+$", "", colnames(aec))
+
+# Variable genes per sample, then Harmony integration across samples
+VariableFeatures(aec) <- split(colnames(aec), aec$SampleID) %>%
+  lapply(function(cells) {
+    VariableFeatures(FindVariableFeatures(aec[, cells], selection.method = "dispersion",
+                                          nfeatures = 2000, layer = "data"))
+  }) %>%
+  unlist() %>%
+  unique()
+
+aec <- ScaleData(aec)
+aec <- RunPCA(aec, npcs = 20)
+aec <- RunHarmony(aec, "SampleID")
+aec <- FindNeighbors(aec, reduction = "harmony", dims = 1:20, k.param = 25)
+for (res in c(0.1, 0.25, 0.5)) {
+  aec <- FindClusters(aec, graph.name = "RNA_snn", algorithm = 4, group.singletons = TRUE,
+                      resolution = res, cluster.name = paste0("Leiden_", res))
+}
+aec <- RunUMAP(aec, reduction = "harmony", dims = 1:20, reduction.name = "umap.harmony")
+
+# Remove MHC class II-expressing cells, then split AECs by HLA-G expression
+aec <- subset(aec, cells = colnames(aec)[FetchData(aec, vars = "HLA-DRB1")[, 1] <= 0.15])
+aec$Subtypes <- ifelse(FetchData(aec, vars = "HLA-G")[, 1] > 0.15, "HLA-G_pos_AEC", "HLA-G_neg_AEC")
+table(aec$Subtypes)
+
+p <- DimPlot(aec, reduction = "umap.harmony", group.by = "Subtypes") |
+     FeaturePlot(aec, reduction = "umap.harmony", features = "HLA-G")
+ggsave(file.path(results_dir, "aec_host", "AEC_reference_umap.pdf"), p, width = 12, height = 5)
+
+saveRDS(aec, file.path(results_dir, "objects", "05_aec_reference.rds"))
+```
+
+### Host cells with human gene names
+
+Border and HG cells from AEC-treated mice (D1 and D4).
+
+```{r host-orthologues}
+hg <- readRDS(hg_object)
+host <- JoinLayers(merge(border, hg))
+host <- subset(host, cells = colnames(host)[host$Group != "Ctrl" & !(host$Condition %in% "PBS")])
+
+counts_human <- convert_orthologs(gene_df = LayerData(host, assay = "RNA", layer = "counts"),
+                                  input_species = "mouse", output_species = "human",
+                                  gene_input = "rownames", gene_output = "rownames",
+                                  non121_strategy = "drop_output_species")
+host_human <- CreateSeuratObject(counts = counts_human, meta.data = host@meta.data)
+host_human <- NormalizeData(host_human)
+```
+
+### CellChat
+
+```{r aec-cellchat}
+aec_types <- c("HLA-G_neg_AEC", "HLA-G_pos_AEC")
+label_order <- c("Dural Fibroblast", "Multicilia Epithelial Cells", "Cuboidal Epithelial Cells",
+                 "Arachnoid Fibroblasts", "Arachnoid Barrier Cells", "Ependymal Cells",
+                 "Leptomeningeal Fibroblast", "Endothelial Cells", "SMCs", "Choroid plexus Fibroblast",
+                 "ILCs/NK Cells", "Ccr2+ Macrophages", "Ccr2- Macrophages", "T Cells", "Ccr2+ Monocytes",
+                 "S100a8+ Cells", "Periosteal Fibroblast", "cDendritic Cells", "Osteoclast",
+                 "HG_1", "HG_2", "HG_3", "HG_4", "HG_5", aec_types)
+
+combined <- JoinLayers(merge(host_human, aec))
+combined$Subtypes <- factor(combined$Subtypes, levels = label_order)
+combined <- subset(combined, cells = colnames(combined)[!is.na(combined$Subtypes)])
+combined$Subtypes <- droplevels(combined$Subtypes)
+table(combined$Subtypes)
+
+# Full human CellChat database. To use only contact and ECM interactions:
+# subsetDB(CellChatDB.human, search = c("ECM-Receptor", "Cell-Cell Contact", "Non-protein Signaling"), key = "annotation")
+db_use <- CellChatDB.human
+
+cellchat <- createCellChat(object = LayerData(combined, assay = "RNA", layer = "data"),
+                           meta = data.frame(labels = combined$Subtypes, row.names = colnames(combined)),
+                           group.by = "labels")
+cellchat@DB <- db_use
+cellchat <- subsetData(cellchat)
+options(future.globals.maxSize = 8 * 1024^3)
+future::plan("multisession", workers = 3)
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+cellchat <- computeCommunProb(cellchat, type = "triMean")
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+future::plan("sequential")
+
+saveRDS(cellchat, file.path(results_dir, "aec_host", "cellchat_aec_host.rds"))
+```
+
+```{r aec-cellchat-plots}
+out <- file.path(results_dir, "aec_host")
+groupSize <- as.numeric(table(cellchat@idents))
+mat <- cellchat@net$weight
+cell_types <- levels(cellchat@idents)
+
+# Overview
+pdf(file.path(out, "Overview.pdf"), width = 10, height = 10)
+netVisual_circle(cellchat@net$count,  vertex.weight = groupSize, weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Interaction strength")
+print(netAnalysis_signalingRole_scatter(cellchat))
+dev.off()
+
+# Signals sent and received by HLA-G+ AECs and HG_2 cells
+pdf(file.path(out, "Overview_AEC_HG2.pdf"), width = 10, height = 10)
+for (ct in intersect(c("HLA-G_pos_AEC", "HG_2"), cell_types)) {
+  netVisual_circle(cellchat@net$count,  sources.use = ct, vertex.weight = groupSize, weight.scale = TRUE,
+                   label.edge = FALSE, title.name = paste("Interactions sent by", ct))
+  netVisual_circle(cellchat@net$weight, targets.use = ct, vertex.weight = groupSize, weight.scale = TRUE,
+                   label.edge = FALSE, title.name = paste("Interaction strength received by", ct))
+}
+dev.off()
+
+# Outgoing interactions of HG_2 and each AEC subtype
+pdf(file.path(out, "Outgoing_AEC_HG2.pdf"), width = 20, height = 15)
+par(mfrow = c(2, 2), xpd = TRUE)
+for (ct in intersect(c("HG_2", aec_types), cell_types)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[ct, ] <- mat[ct, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = TRUE,
+                   edge.weight.max = max(mat), title.name = ct)
+}
+dev.off()
+
+# Ligand-receptor pairs sent by HLA-G+ AECs
+p <- netVisual_bubble(cellchat, sources.use = "HLA-G_pos_AEC", remove.isolate = FALSE)
+ggsave(file.path(out, "HLA-G_pos_AEC_bubble.pdf"), p, width = 8, height = 30, limitsize = FALSE)
+
+pdf(file.path(out, "HLA-G_pos_AEC_chord.pdf"), width = 20, height = 20)
+netVisual_chord_gene(cellchat, sources.use = "HLA-G_pos_AEC", lab.cex = 0.8, legend.pos.y = 10)
+dev.off()
+
+if ("MIF" %in% cellchat@netP$pathways) {
+  pdf(file.path(out, "HLA-G_pos_AEC_MIF.pdf"), width = 10, height = 10)
+  netVisual_chord_gene(cellchat, sources.use = "HLA-G_pos_AEC", signaling = "MIF",
+                       lab.cex = 0.8, legend.pos.y = 30)
+  dev.off()
+}
+
+# Signals received by Ccr2+ monocytes and macrophages
+pdf(file.path(out, "To_Ccr2_cells.pdf"), width = 30, height = 30)
+netVisual_chord_gene(cellchat, targets.use = intersect(c("Ccr2+ Macrophages", "Ccr2+ Monocytes"), cell_types),
+                     lab.cex = 0.8, legend.pos.y = 30)
+dev.off()
+
+# Signalling roles of all cell types
+pdf(file.path(out, "Signaling_roles.pdf"), width = 18, height = 25)
+draw(netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing", width = 8, height = 25, cluster.cols = TRUE) +
+     netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming", width = 8, height = 25, cluster.cols = TRUE))
+dev.off()
+
+# Every detected pathway: chord diagram and signalling roles
+for (pw in cellchat@netP$pathways) {
+  pdf(file.path(out, "pathways", paste0(pw, ".pdf")), width = 10, height = 10)
+  netVisual_chord_cell(cellchat, signaling = pw, lab.cex = 0.8, legend.pos.y = 30)
+  netAnalysis_signalingRole_network(cellchat, signaling = pw, width = 10, height = 2.5, font.size = 10)
+  dev.off()
+}
+```
+
+### Interactions specific to AECs
+
+```{r aec-specific}
+all_lr <- subsetCommunication(cellchat, thresh = 0.05)
+write.csv(all_lr, file.path(results_dir, "aec_host", "All_interactions.csv"), row.names = FALSE)
+
+# Pathway strength sent by HLA-G+ AECs
+pathway_score <- apply(cellchat@netP$prob["HLA-G_pos_AEC", , , drop = FALSE], 3, sum, na.rm = TRUE)
+pathway_score <- sort(pathway_score, decreasing = TRUE)
+write.csv(tibble(pathway = names(pathway_score), score = pathway_score),
+          file.path(results_dir, "aec_host", "HLA-G_pos_AEC_pathway_scores.csv"), row.names = FALSE)
+
+# Ligand-receptor pairs for which HLA-G+ AECs are the only sender
+aec_only <- all_lr %>%
+  group_by(interaction_name) %>%
+  dplyr::filter(all(as.character(source) == "HLA-G_pos_AEC")) %>%
+  ungroup() %>%
+  dplyr::select(source, target, ligand, receptor, interaction_name, pathway_name, prob, pval) %>%
+  arrange(target, desc(prob))
+write.csv(aec_only, file.path(results_dir, "aec_host", "HLA-G_pos_AEC_specific_interactions.csv"), row.names = FALSE)
+```
+
+### Selected AEC signals
+
+```{r aec-selected}
+plot_lr_tiles <- function(source, pathways) {
+  d <- netVisual_bubble(cellchat, sources.use = source, signaling = intersect(pathways, cellchat@netP$pathways),
+                        remove.isolate = FALSE, return.data = TRUE)$communication
+  ggplot(d, aes(x = source.target, y = factor(interaction_name_2), fill = prob)) +
+    geom_vline(xintercept = seq(2.5, length(unique(d$source.target)) + 0.5, by = 2),
+               colour = "grey85", linewidth = 0.6) +
+    geom_tile(colour = "grey80") +
+    scale_fill_gradientn(colours = c("#4575B4", "#FFFFBF", "#D73027"), na.value = "white") +
+    labs(x = "Interactions", y = "Ligand-receptor", fill = "Communication probability",
+         title = source) +
+    theme_bw() +
+    theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+selected_small <- c("CD99", "SLITRK", "EDN", "DESMOSOME", "CALCR")
+selected_large <- c("CD276", "PTH", "PARs", "IGFBP", "EGF", "HSPG", "CD46", selected_small)
+
+for (sel in list(list(name = "Molecules_clean", pathways = selected_small, height = 8),
+                 list(name = "Molecules",       pathways = selected_large, height = 9))) {
+  p <- wrap_plots(lapply(aec_types, plot_lr_tiles, pathways = sel$pathways), ncol = 1)
+  ggsave(file.path(results_dir, "aec_host", paste0(sel$name, ".pdf")), p,
+         width = 12, height = 2 * sel$height, dpi = 600)
+}
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```
+

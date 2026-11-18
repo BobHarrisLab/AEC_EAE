@@ -24,9 +24,31 @@ All data are from mouse; reads were aligned to the GRCm39 reference genome.
 ```
 ├── Bulk.qmd                     # Bulk RNA-seq: PCA, DESeq2, volcano plots, GO/GSEA, Venn diagrams
 ├── Proteomics.qmd               # Proteomics: normalisation, PCA, DEqMS, GO/GSEA
-├── scRNA/
-│   ├── scAnalysis.qmd           # QC, doublet removal, integration, clustering, annotation, subclustering
-│   └── Other calculations.qmd   # Cell Ranger commands, HG/immune merge, CellChat, SCENIC, label transfer
+├── scRNA_brain_CD45_HG/                           # Brain CD45+ immune cells and HG cells
+│   ├── 00_cellranger.sh                           # Cell Ranger commands
+│   ├── 01_brain_CD45_QC_integration_annotation.qmd
+│   ├── 02_merge_CD45_HG.Rmd                       # Merge with HG cells, Harmony, markers, proportions
+│   ├── 03_selected_genes.Rmd
+│   ├── 04_trajectory_Slingshot_tradeSeq_Monocle3.Rmd
+│   ├── 05_CellChat.qmd
+│   ├── 06_NicheNet.Rmd
+│   ├── 07_SCENIC.qmd
+│   ├── 08_HG_label_transfer_Azimuth.qmd
+│   └── 09_phagocytosis_neutrophil_genes.Rmd
+├── snRNA_brain_border_timecourse/                 # Brain border snRNA-seq, Ctrl, day 1 and day 4
+│   ├── 01_QC_integration_annotation_DE.qmd        # QC, integration, annotation, proportions, time-point DE
+│   └── 02_CellChat_NicheNet_with_HG.qmd
+├── scRNA_PBS_vs_AEC/
+│   ├── 01_QC_integration_annotation.Rmd
+│   ├── 02_myeloid_cells.Rmd
+│   ├── 03_mast_T_B_dendritic_neutrophil.Rmd
+│   ├── 04_cell_communication_CellChat_LIANA.Rmd
+│   ├── 05_SCENIC.Rmd
+│   └── 06_myeloid_trajectory.Rmd
+├── snRNA_PBS_vs_AEC/
+│   ├── 01_QC_integration_annotation.Rmd
+│   ├── 02_oligodendrocyte_lineage.Rmd
+│   └── 03_neurons_astrocytes_fibroblasts.Rmd
 ├── LICENSE
 └── README.md
 ```

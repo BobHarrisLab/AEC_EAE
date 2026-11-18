@@ -1,0 +1,448 @@
+---
+title: "scRNA-seq PBS vs AEC: mast cells, T cells, B cells, dendritic cells and neutrophils"
+author: "Yuxi"
+date: "2022-11-24"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+Single cell RNA-seq of one PBS-treated and one AEC-treated mouse. Ambient RNA was removed with CellBender.
+This script was written for Seurat v4. To run it with Seurat v5, keep `options(Seurat.object.assay.version = "v3")` in the setup chunk.
+
+Subclustering, DEGs and enrichment for each of the other immune cell types.
+Starts from the objects in `data/cell/` saved by `01_QC_integration_annotation.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load all the packages}
+library(tidyverse)
+library(Matrix)
+library(Seurat)
+options(Seurat.object.assay.version = "v3")
+
+library(cowplot)
+library(clustree)
+library(niceRplots)
+library(scCustomize)
+library(harmony)
+library(geomtextpath)
+library(webr)
+library(ComplexHeatmap)
+library(RColorBrewer)
+
+#For preprocessing
+library(DoubletFinder)
+
+#For Cell interaction
+library(CellChat)
+library(liana)
+
+#For enrichment Analysis
+library(correlationAnalyzeR)
+library(clusterProfiler)
+library(xlsx)
+library(gprofiler2)
+library(plotly)
+library(DOSE)
+
+#For transcriptional factor network
+library(loomR)
+
+#For Trajectory imputation
+library(slingshot)
+library(tradeSeq)
+library(fields)
+library(rafalib)
+
+for (d in c("data/cell", "results/cell/Myeloid", "results/cell/Myeloid/Trajectory", "results/cell/Mast", "results/cell/Tcell", "results/cell/Bcell", "results/cell/DC", "results/cell/Neutrophil", "results/cell/Cellchat", "results/cell/LIANA", "results/cell/SCENIC")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+
+```{r Mast Cells}
+DATA_Immune <- readRDS("data/cell/Cell_Immune.rds")
+DATA_Immune <- SetIdent(DATA_Immune, value = "Celltypes")
+
+DATA_Mast <- subset(DATA_Immune, idents = c("Mast Cell"))
+
+DefaultAssay(DATA_Mast) <- "CCA"
+DATA_Mast <- ScaleData(DATA_Mast, features = rownames(DATA_Mast))
+DATA_Mast <- RunPCA(DATA_Mast, npcs = 30)
+DATA_Mast <- RunUMAP(DATA_Mast, dims = 1:30)
+
+DimPlot(DATA_Mast, group.by = "Condition")
+
+# Redo the clustering ----
+DATA_Mast <- FindNeighbors(DATA_Mast, dims = 1:30, k.param = 15)
+
+for (res in c(0.1, 0.15,0.16,0.17,0.18,0.2,0.25,0.3,0.35,0.4,0.45, 0.5,0.55,0.6,0.65,0.75, 1,1.25, 1.5,1.75, 2,2.25, 2.5,3)) {
+  print(paste0("current res", res))
+    DATA_Mast <- FindClusters(DATA_Mast, graph.name = "CCA_snn", resolution = res, algorithm = 1)
+}
+
+clustree(DATA_Mast@meta.data, prefix = "CCA_snn_res.")
+DATA_Mast$seurat_subclusters <- DATA_Mast$CCA_snn_res.0.1
+
+DefaultAssay(DATA_Mast)<- "RNA"
+
+DimPlot(DATA_Mast, group.by = "CCA_snn_res.0.1", label = T)
+plot_dots(DATA_Mast, genes = c("Il4","Il1rl1","Cpa3","Mcpt8","Cd200r3","Cx3cr1","Cxcr4","Hif1a"),clustering = "Condition")
+VlnPlot(DATA_Mast,group.by = "Condition",features = c("Il4","Il1rl1","Cpa3","Mcpt8","Cd200r3","Cx3cr1","Cxcr4","Hif1a"))
+plot_grid(FeaturePlot(DATA_Mast, c("Il4","Il1rl1","Cpa3","Mcpt8", "H2-K1","H2-D1","Mcpt1","Top2a","Mki67")),DimPlot(DATA_Mast,group.by = "CCA_snn_res.0.1"))
+VlnPlot(DATA_Immune,c("Il4","Il1rl1","Cpa3","Mcpt8","Cd200","Cd200r3","Il33"),group.by = "Celltypes")
+
+# DEGs for condition----
+DATA_Mast <- SetIdent(DATA_Mast, value = "Condition")
+detable_all <- FindAllMarkers(DATA_Mast, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(top20_all, file = "results/cell/Mast/Mast_ConditionMarkers_top20.csv")
+write.csv(detable_all, file = "results/cell/Mast/Mast_ConditionMarkers_All.csv")
+write.csv(top5_all, file = "results/cell/Mast/Mast_ConditionMarkers_top5.csv")
+
+plot_dots(DATA_Mast, genes = c( as.character(unique(top20_all$gene))),assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+#GSEA Analysis on each condition----
+TERM2GENE <- getTERM2GENE(GSEA_Type = "GO:BP", Species = "mmusculus")
+KEGG <- getTERM2GENE(GSEA_Type = "KEGG", Species = "mmusculus")
+
+for (i in c("PBS","AEC")) {
+print(paste0("Current Condition is ", i))
+geneList <- detable_all[detable_all$cluster == i,]$avg_log2FC
+names(geneList)=detable_all[detable_all$cluster == i,]$gene
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE =TERM2GENE,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Mast/Mast_GSEA.xlsx", sheetName = paste0("GSEA_GO_Condition",i), append = TRUE)
+
+GOBP <-GSEA(geneList, TERM2GENE =KEGG,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Mast/Mast_GSEA.xlsx", sheetName = paste0("GSEA_KEGG_Condition",i), append = TRUE)
+}
+
+# Geneoncology ----
+for (i in c("PBS","AEC")) {
+print(paste0("Current Condition is ", i))
+genelist=detable_all[detable_all$cluster == i,]$gene
+go = gost(genelist, organism = 'mmusculus')
+
+write.xlsx(as.data.frame(go$result[, c("term_name","p_value", "intersection_size", "term_size","term_id", "source")]), file = "results/cell/Mast/Mast_GSEA.xlsx", sheetName = paste0("GO_Condition ",i), append = TRUE)
+htmlwidgets::saveWidget(as_widget(gostplot(go,interactive = T)%>% layout(title = paste0("Condition ", i))), paste0("results/cell/Mast/Mast_Condition ",i," GO.html"))
+}
+
+```
+
+```{r T Cell}
+DATA_Immune <- readRDS("data/cell/Cell_Immune.rds")
+DATA_Immune <- SetIdent(DATA_Immune, value = "Celltypes")
+
+DATA_T <- subset(DATA_Immune, idents = c("T Cell"))
+
+DefaultAssay(DATA_T) <- "CCA"
+DATA_T <- ScaleData(DATA_T, features = rownames(DATA_T))
+DATA_T <- RunPCA(DATA_T, npcs = 30)
+DATA_T <- RunUMAP(DATA_T, dims = 1:30)
+
+DimPlot(DATA_T, group.by = "Condition")
+FeaturePlot(DATA_T, features = c("Cd3e","Cd4","Cd8a","Cd8b1"))
+
+# Redo the clustering ----
+DATA_T <- FindNeighbors(DATA_T, dims = 1:30, k.param = 10)
+
+for (res in c(0.1, 0.15,0.16,0.17,0.18,0.2,0.25,0.3,0.35,0.4,0.45, 0.5,0.55,0.6,0.65,0.75, 1,1.25, 1.5,1.75, 2,2.25, 2.5,3)) {
+  print(paste0("current res", res))
+    DATA_T <- FindClusters(DATA_T, graph.name = "CCA_snn", resolution = res, algorithm = 1)
+}
+
+clustree(DATA_T@meta.data, prefix = "CCA_snn_res.")
+DimPlot(DATA_T, group.by = "CCA_snn_res.0.45", label = T)
+
+# Generate Condition Specific GeneList ----
+DefaultAssay(DATA_T) <-  "RNA"
+DATA_T <- SetIdent(DATA_T, value = "Condition")
+detable_all <- FindAllMarkers(DATA_T, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(top20_all, file = "results/cell/Tcell/Tcell_ConditionMarkers_top20.csv")
+write.csv(detable_all, file = "results/cell/Tcell/Tcell_ConditionMarkers_All.csv")
+write.csv(top5_all, file = "results/cell/Tcell/Tcell_ConditionMarkers_top5.csv")
+plot_dots(DATA_T, genes = c( as.character(unique(top20_all$gene)), "Pdcd1", "Ctla4"),main = "T cell",assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+plot_dots(DATA_T, genes = c("Cd4","Cd8a","Cd3e","Foxp3","Cd69","Cd44","Sell","Il17a","Il4","Cxcr5","Ifng","Pdcd1","Havcr2","Lag3","Tbx21","Tcf7","Slamf6","Eomes","Nr4a1","Tox","Prdm1","Runx3","Bax","Bcl2","Cycs","Fas","Il7r","Entpd1","Ctla4","Cd28","Cxcl13","Icos","Il2ra","Cd14","Cd244","Cd160","Tigit"),assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+FeaturePlot(DATA_T,c("Slamf6","Tcf7","Cd4","Cd8a","Ctla4"))
+
+#GSEA Analysis on each condition----
+TERM2GENE <- getTERM2GENE(GSEA_Type = "GO:BP", Species = "mmusculus")
+KEGG <- getTERM2GENE(GSEA_Type = "KEGG", Species = "mmusculus")
+
+for (i in c("PBS","AEC")) {
+print(paste0("Current Condition is ", i))
+geneList <- detable_all[detable_all$cluster == i,]$avg_log2FC
+names(geneList)=detable_all[detable_all$cluster == i,]$gene
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE =TERM2GENE,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Tcell/Tcell_GSEA.xlsx", sheetName = paste0("GSEA_GO_Condition",i), append = TRUE)
+
+GOBP <-GSEA(geneList, TERM2GENE =KEGG,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Tcell/Tcell_GSEA.xlsx", sheetName = paste0("GSEA_KEGG_Condition",i), append = TRUE)
+}
+
+# Geneoncology ----
+for (i in c("PBS","AEC")) {
+print(paste0("Current Condition is ", i))
+genelist=detable_all[detable_all$cluster == i,]$gene
+go = gost(genelist, organism = 'mmusculus')
+
+write.xlsx(as.data.frame(go$result[, c("term_name","p_value", "intersection_size", "term_size","term_id", "source")]), file = "results/cell/Tcell/Tcell_GSEA.xlsx", sheetName = paste0("GO_Condition ",i), append = TRUE)
+htmlwidgets::saveWidget(as_widget(gostplot(go,interactive = T)%>% layout(title = paste0("Condition ", i))), paste0("results/cell/Tcell/Tcell_Condition ",i," GO.html"))
+}
+
+```
+
+```{r B Cell}
+DATA_Immune <- readRDS("data/cell/Cell_Immune.rds")
+DATA_Immune <- SetIdent(DATA_Immune, value = "Celltypes")
+
+DATA_B <- subset(DATA_Immune, idents = c("B Cell"))
+
+DefaultAssay(DATA_B) <- "CCA"
+DATA_B <- ScaleData(DATA_B, features = rownames(DATA_B))
+DATA_B <- RunPCA(DATA_B, npcs = 30)
+DATA_B <- RunUMAP(DATA_B, dims = 1:30)
+
+DimPlot(DATA_B)
+FeaturePlot(DATA_B, features = c("Pax5","Cd19", "Cxcr4", "Tnfrsf17"))
+
+# Redo the clustering ----
+DATA_B <- FindNeighbors(DATA_B, dims = 1:30, k.param = 10)
+
+for (res in c(0.1, 0.15,0.16,0.17,0.18,0.2,0.25,0.3,0.35,0.4,0.45, 0.5,0.55,0.6,0.65,0.75, 1,1.25, 1.5,1.75, 2,2.25, 2.5,3)) {
+  print(paste0("current res", res))
+    DATA_B <- FindClusters(DATA_B, graph.name = "CCA_snn", resolution = res, algorithm = 1)
+}
+
+clustree(DATA_B@meta.data, prefix = "CCA_snn_res.")
+DimPlot(DATA_B, group.by = "CCA_snn_res.0.1", label = T, pt.size = 3)
+
+# Generate Cluster Specific GeneList ----
+DefaultAssay(DATA_B) <-  "RNA"
+plot_dots(DATA_B, genes = c("Fas","Cd69","Cd80","Cd86","Cd40","Tnfrsf13c","Tnfrsf13b","H2-Aa", "H2-Ab1", "H2-D1", "H2-DMa", "H2-DMb1", "H2-DMb2", "H2-Ea-ps", "H2-Eb1", "H2-K1", "H2-M3", "H2-Ob", "H2-Q1", "H2-Q10", "H2-Q2", "H2-T23","Cd74","Cd27","Ptprc","Cd38","Slc3a2","Cxcr4","Ly6k","Atxn1","Sdc1","Irf4","Igsf1","Ighg2b","Ighm","Ighg1","Ighd","Iglc2","Iglc3","Iglc1","Iglv2","Ighe","Jchain","Vpreb1","Pax5","Cd19","Cd1d","Cd24a","Cd22"),clustering = "CCA_snn_res.0.1")
+plot_dots(DATA_B, genes = c("Ighd","Ighm","Cd69","Cd79a","Cd38","H2-D1", "H2-K1","H2-Aa", "H2-Ab1", "H2-DMa", "H2-DMb1", "H2-DMb2", "H2-Ea-ps", "H2-Eb1",  "H2-M3", "H2-Ob", "H2-Q1", "H2-Q10", "H2-Q2", "H2-T23","Cd74","Ms4a1"),clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+DATA_B <- SetIdent(DATA_B, value = "CCA_snn_res.0.1")
+detable_all <- FindAllMarkers(DATA_B, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(top20_all, file = "results/cell/Bcell/Bcell_ClusterMarkers_top20.csv")
+write.csv(detable_all, file = "results/cell/Bcell/Bcell_ClusterMarkers_All.csv")
+write.csv(top5_all, file = "results/cell/Bcell/Bcell_ClusterMarkers_top5.csv")
+plot_dots(DATA_B, genes = c( as.character(unique(top20_all$gene)), "Top2a", "Mki67"),main = "B cell",assay = "RNA",clustering = "CCA_snn_res.0.1", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+# Proportions----
+summarized.df <- DATA_B@meta.data %>%
+  group_by(Condition, CCA_snn_res.0.1) %>%
+  summarize(nCells = n()) %>%
+  group_by(Condition) %>%
+  mutate(prop = nCells/sum(nCells))
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = CCA_snn_res.0.1), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip()
+
+#GSEA Analysis on each clusters----
+TERM2GENE <- getTERM2GENE(GSEA_Type = "GO:BP", Species = "mmusculus")
+KEGG <- getTERM2GENE(GSEA_Type = "KEGG", Species = "mmusculus")
+
+for (i in c("0","1")) {
+print(paste0("Current Cluster is ", i))
+geneList <- detable_all[detable_all$cluster == i,]$avg_log2FC
+names(geneList)=detable_all[detable_all$cluster == i,]$gene
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE =TERM2GENE,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Bcell/Bcell_GSEA.xlsx", sheetName = paste0("GSEA_GO_Cluster",i), append = TRUE)
+
+GOBP <-GSEA(geneList, TERM2GENE =KEGG,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Bcell/Bcell_GSEA.xlsx", sheetName = paste0("GSEA_KEGG_Cluster",i), append = TRUE)
+}
+
+#DotPlot for GSEA----
+geneList <- detable_all[detable_all$cluster == 0,]$avg_log2FC
+names(geneList)=detable_all[detable_all$cluster == 0,]$gene
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE =TERM2GENE,
+            pvalueCutoff = 0.1, scoreType= "pos")
+dotplot(GOBP, showCategory=c("GOBP_RESPONSE_TO_CYTOKINE", "GOBP_REGULATION_OF_CELL_DEATH", "GOBP_RESPONSE_TO_LIPID", "GOBP_NEGATIVE_REGULATION_OF_CELL_DEATH", "GOBP_NEGATIVE_REGULATION_OF_LIPID_LOCALIZATION", "GOBP_CELLULAR_RESPONSE_TO_GLUCOSE_STARVATION", "GOBP_CELLULAR_RESPONSE_TO_LIPID")
+)
+
+# Geneoncology ----
+for (i in c("0","1")) {
+print(paste0("Current Cluster is ", i))
+genelist=detable_all[detable_all$cluster == i,]$gene
+go = gost(genelist, organism = 'mmusculus')
+
+write.xlsx(as.data.frame(go$result[, c("term_name","p_value", "intersection_size", "term_size","term_id", "source")]), file = "results/cell/Bcell/Bcell_GSEA.xlsx", sheetName = paste0("GO_Cluster ",i), append = TRUE)
+htmlwidgets::saveWidget(as_widget(gostplot(go,interactive = T)%>% layout(title = paste0("Cluster ", i))), paste0("results/cell/Bcell/Bcell_Cluster ",i," GO.html"))
+}
+
+```
+
+```{r Dendrtic Cell}
+DATA_Immune <- readRDS("data/cell/Cell_Immune.rds")
+DATA_Immune <- SetIdent(DATA_Immune, value = "Celltypes")
+
+DATA_Dendritic <- subset(DATA_Immune, idents = c("Dendritic Cells"))
+
+DefaultAssay(DATA_Dendritic) <- "CCA"
+DATA_Dendritic <- ScaleData(DATA_Dendritic, features = rownames(DATA_Dendritic))
+DATA_Dendritic <- RunPCA(DATA_Dendritic, npcs = 30)
+DATA_Dendritic <- RunUMAP(DATA_Dendritic, dims = 1:30)
+
+DimPlot(DATA_Dendritic, group.by = "Condition")
+FeaturePlot(DATA_Dendritic, features = c("Cd200"))
+
+# Generate Condition Specific GeneList ----
+DefaultAssay(DATA_Dendritic) <-  "RNA"
+DATA_Dendritic <- SetIdent(DATA_Dendritic, value = "Condition")
+detable_all <- FindAllMarkers(DATA_Dendritic, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(top20_all, file = "results/cell/DC/DC_ConditionMarkers_top20.csv")
+write.csv(detable_all, file = "results/cell/DC/DC_ConditionMarkers_All.csv")
+write.csv(top5_all, file = "results/cell/DC/DC_ConditionMarkers_top5.csv")
+plot_dots(DATA_Dendritic, genes = c( as.character(unique(top20_all$gene))),main = "Dendritic cell",assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+#GSEA Analysis on each condition----
+TERM2GENE <- getTERM2GENE(GSEA_Type = "GO:BP", Species = "mmusculus")
+KEGG <- getTERM2GENE(GSEA_Type = "KEGG", Species = "mmusculus")
+
+for (i in c("PBS","AEC")) {
+print(paste0("Current Condition is ", i))
+geneList <- detable_all[detable_all$cluster == i,]$avg_log2FC
+names(geneList)=detable_all[detable_all$cluster == i,]$gene
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE =TERM2GENE,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/DC/DC_GSEA.xlsx", sheetName = paste0("GSEA_GO_Condition",i), append = TRUE)
+
+GOBP <-GSEA(geneList, TERM2GENE =KEGG,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/DC/DC_GSEA.xlsx", sheetName = paste0("GSEA_KEGG_Condition",i), append = TRUE)
+}
+
+# Geneoncology ----
+for (i in c("PBS","AEC")) {
+print(paste0("Current Condition is ", i))
+genelist=detable_all[detable_all$cluster == i,]$gene
+go = gost(genelist, organism = 'mmusculus')
+
+write.xlsx(as.data.frame(go$result[, c("term_name","p_value", "intersection_size", "term_size","term_id", "source")]), file = "results/cell/DC/DC_GSEA.xlsx", sheetName = paste0("GO_Condition ",i), append = TRUE)
+htmlwidgets::saveWidget(as_widget(gostplot(go,interactive = T)%>% layout(title = paste0("Condition ", i))), paste0("results/cell/DC/DC_Condition ",i," GO.html"))
+}
+
+```
+
+```{r Neutrophil}
+DATA_Immune <- readRDS("data/cell/Cell_Immune.rds")
+DATA_Immune <- SetIdent(DATA_Immune, value = "Celltypes")
+
+DATA_Neutrophil <- subset(DATA_Immune, idents = c("Neutrophil"))
+
+DefaultAssay(DATA_Neutrophil) <- "CCA"
+DATA_Neutrophil <- ScaleData(DATA_Neutrophil, features = rownames(DATA_Neutrophil))
+DATA_Neutrophil <- RunPCA(DATA_Neutrophil, npcs = 30)
+DATA_Neutrophil <- RunUMAP(DATA_Neutrophil, dims = 1:30)
+
+DimPlot(DATA_Neutrophil, group.by = "Condition")
+
+# Generate Condition Specific GeneList ----
+DefaultAssay(DATA_Neutrophil) <-  "RNA"
+DATA_Neutrophil <- SetIdent(DATA_Neutrophil, value = "Condition")
+detable_all <- FindAllMarkers(DATA_Neutrophil, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(top20_all, file = "results/cell/Neutrophil/Neutrophil_ConditionMarkers_top20.csv")
+write.csv(detable_all, file = "results/cell/Neutrophil/Neutrophil_ConditionMarkers_All.csv")
+write.csv(top5_all, file = "results/cell/Neutrophil/Neutrophil_ConditionMarkers_top5.csv")
+plot_dots(DATA_Neutrophil, genes = c( as.character(unique(top20_all$gene))),main = "Neutrophil ",assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+#GSEA Analysis on each condition----
+TERM2GENE <- getTERM2GENE(GSEA_Type = "GO:BP", Species = "mmusculus")
+KEGG <- getTERM2GENE(GSEA_Type = "KEGG", Species = "mmusculus")
+
+for (i in c("PBS","AEC")) {
+print(paste0("Current Condition is ", i))
+geneList <- detable_all[detable_all$cluster == i,]$avg_log2FC
+names(geneList)=detable_all[detable_all$cluster == i,]$gene
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE =TERM2GENE,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Neutrophil/Neutrophil_GSEA.xlsx", sheetName = paste0("GSEA_GO_Condition",i), append = TRUE)
+
+GOBP <-GSEA(geneList, TERM2GENE =KEGG,
+            pvalueCutoff = 1, scoreType = "pos")
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Neutrophil/Neutrophil_GSEA.xlsx", sheetName = paste0("GSEA_KEGG_Condition",i), append = TRUE)
+}
+
+# Geneoncology ----
+for (i in c("PBS","AEC")) {
+print(paste0("Current Condition is ", i))
+genelist=detable_all[detable_all$cluster == i,]$gene
+go = gost(genelist, organism = 'mmusculus')
+
+write.xlsx(as.data.frame(go$result[, c("term_name","p_value", "intersection_size", "term_size","term_id", "source")]), file = "results/cell/Neutrophil/Neutrophil_GSEA.xlsx", sheetName = paste0("GO_Condition ",i), append = TRUE)
+htmlwidgets::saveWidget(as_widget(gostplot(go,interactive = T)%>% layout(title = paste0("Condition ", i))), paste0("results/cell/Neutrophil/Neutrophil_Condition ",i," GO.html"))
+}
+
+```

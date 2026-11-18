@@ -1,0 +1,474 @@
+---
+title: "scRNA-seq PBS vs AEC: myeloid cells"
+author: "Yuxi"
+date: "2022-11-24"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+Single cell RNA-seq of one PBS-treated and one AEC-treated mouse. Ambient RNA was removed with CellBender.
+This script was written for Seurat v4. To run it with Seurat v5, keep `options(Seurat.object.assay.version = "v3")` in the setup chunk.
+
+Subclustering of myeloid cells, gene panels, module scores, DEGs and enrichment between subclusters and conditions, Mrc1+ cells.
+Starts from the objects in `data/cell/` saved by `01_QC_integration_annotation.Rmd`. Gene panels: `data/gene_panels/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load all the packages}
+library(tidyverse)
+library(Matrix)
+library(Seurat)
+options(Seurat.object.assay.version = "v3")
+
+library(cowplot)
+library(clustree)
+library(niceRplots)
+library(scCustomize)
+library(harmony)
+library(geomtextpath)
+library(webr)
+library(ComplexHeatmap)
+library(RColorBrewer)
+
+#For preprocessing
+library(DoubletFinder)
+
+#For Cell interaction
+library(CellChat)
+library(liana)
+
+#For enrichment Analysis
+library(correlationAnalyzeR)
+library(clusterProfiler)
+library(xlsx)
+library(gprofiler2)
+library(plotly)
+library(DOSE)
+
+#For transcriptional factor network
+library(loomR)
+
+#For Trajectory imputation
+library(slingshot)
+library(tradeSeq)
+library(fields)
+library(rafalib)
+
+for (d in c("data/cell", "results/cell/Myeloid", "results/cell/Myeloid/Trajectory", "results/cell/Mast", "results/cell/Tcell", "results/cell/Bcell", "results/cell/DC", "results/cell/Neutrophil", "results/cell/Cellchat", "results/cell/LIANA", "results/cell/SCENIC")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+
+```{r Myeloid Cells}
+DATA_Immune <- readRDS("data/cell/Cell_Immune.rds")
+DATA_Immune <- SetIdent(DATA_Immune, value = "Celltypes")
+DATA_Myeloid <- subset(DATA_Immune, idents = c("Myeloid Cell"))
+
+DefaultAssay(DATA_Myeloid) <- "CCA"
+DATA_Myeloid <- ScaleData(DATA_Myeloid, features = rownames(DATA_Myeloid))
+DATA_Myeloid <- RunPCA(DATA_Myeloid, npcs = 30)
+DATA_Myeloid <- RunUMAP(DATA_Myeloid, dims = 1:30)
+
+DimPlot(DATA_Myeloid, split.by = "Condition")
+
+# Redo the clustering ----
+DATA_Myeloid <- FindNeighbors(DATA_Myeloid, dims = 1:30, k.param = 15)
+
+for (res in c(0.1, 0.15,0.16,0.17,0.18,0.2,0.25,0.3,0.35,0.4,0.45, 0.5,0.55,0.6,0.65,0.75, 1,1.25, 1.5,1.75, 2,2.25, 2.5,3)) {
+  print(paste0("current res", res))
+    DATA_Myeloid <- FindClusters(DATA_Myeloid, graph.name = "CCA_snn", resolution = res, algorithm = 1)
+}
+
+clustree(DATA_Myeloid@meta.data, prefix = "CCA_snn_res.")
+
+# Lets go for resolution 0.3----
+DATA_Myeloid <- SetIdent(DATA_Myeloid, value = "CCA_snn_res.0.3")
+DATA_Myeloid$seurat_subclusters <- DATA_Myeloid$CCA_snn_res.0.3
+plot_grid(DimPlot(DATA_Myeloid, group.by = "CCA_snn_res.0.25", label = T),
+          DimPlot(DATA_Myeloid, group.by = "CCA_snn_res.0.3", label = T),
+          FeaturePlot(DATA_Myeloid,c("Ptprc","P2ry12"))
+          )
+
+DimPlot(DATA_Myeloid, group.by = "CCA_snn_res.0.3", label = T)+ggtitle("Myeloid Cells Subtypes")
+
+#Annotate the myeloid Cells roughly (resolution 0.25)----
+DATA_Myeloid <- SetIdent(DATA_Myeloid, value = "CCA_snn_res.0.25")
+new.ids <- c("Mac-1",
+             "Mac-2",
+             "Mac-1",
+             "Mac-2",
+             "Prolif-Mac",
+             "Mac-1",
+             "Mac-2",
+             "M2-Mac",
+             "M2-Mac")
+DefaultAssay(DATA_Myeloid) <- "RNA"
+new.ids <- setNames(new.ids,as.character(0:(length(new.ids)-1) ))
+DATA_Myeloid$Subtypes1 <- new.ids [ match( as.character(DATA_Myeloid$CCA_snn_res.0.25) , names(new.ids))  ]
+DimPlot(DATA_Myeloid, group.by = "Subtypes1")
+
+saveRDS(DATA_Myeloid, "data/cell/Cell_Myeloid2.rds")
+
+#Proportions----
+summarized.df <- DATA_Myeloid@meta.data %>%
+  group_by(Condition, seurat_subclusters) %>%
+  summarize(nCells = n()) %>%
+  group_by(Condition) %>%
+  mutate(prop = nCells/sum(nCells))
+
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = seurat_subclusters), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip()
+
+PieDonut(summarized.df, aes(Condition,seurat_subclusters, count = nCells),r0 = 0.3, ratioByGroup = T,showRatioThreshold = 0, labelpositionThreshold = 0.1)
+
+
+#Gene panels from nanostring----
+for (panel in c("metabolic pannel", "Neuroinflammation", "Innate Immunity")) {
+a <- read.delim(paste0("data/gene_panels/", panel, ".txt"), header = F)
+b <- as.vector(a$V1)%>% unique()
+c <- intersect(rownames(DATA_Myeloid[["RNA"]]@data),b)
+DATA_Myeloid2<- ScaleData(DATA_Myeloid, features = c)
+ord_all <- factor(sapply(c,function(x){getcluster(DATA_Myeloid2, x, "seurat_subclusters")}))
+d<-c[order(as.character(ord_all) )]
+print(DoHeatmap(DATA_Myeloid2, group.by = "seurat_subclusters",features = d)+
+ theme(axis.text.y = element_text(size = 2)) + ggtitle(panel))
+}
+
+#Gene lists----
+glycolysis <- c("Adh1", "Adh4", "Adh7", "Aldh2", "Aldoa", "Aldob", "Eno1", "Eno3", "Fbp1", "G6pc", "Gapdh", "Gapdhs", "Gck", "Gpi1", "Hk1", "Hk2", "Hk3", "Ldha", "Ldhb", "Ldhc", "Ndc1", "Nup153", "Nup205", "Nup62", "Pck1", "Pck2", "Pdha1", "Pfkfb1", "Pfkl", "Pfkm", "Pgam2", "Pgk1", "Pgm1", "Pklr", "Pkm", "Ranbp2", "Sec13", "Tpr")
+
+tca_oxphos <- c("Atp5d", "Atp5k", "Atp6v1f", "Cox10", "Cox14", "Cox4i1", "Cox5a", "Cox5b", "Cox6a1", "Cox6b1", "Cox7b", "Cox7c", "Cox8a", "Cs", "D2hgdh", "Fahd1", "Fh1", "Glud1", "Idh2", "Idh3a", "Idh3b", "Idh3g", "L2hgdh", "Ldha", "Ldhb", "Ldhc", "Me2", "Mpc1", "Mpc2", "Ncoa2", "Ncor1", "Ndufa1", "Ndufa11", "Ndufa12", "Ndufa13", "Ndufa2", "Ndufa3", "Ndufa4", "Ndufa6", "Ndufa7", "Ndufb10", "Ndufb11", "Ndufb2", "Ndufb4", "Ndufb7", "Ndufb8", "Ndufs7", "Ndufs8", "Nrf1", "Ogdh", "Pdha1", "Pdk1", "Pdk2", "Pdk3", "Pdk4", "Pdp1", "Pemt", "Ppargc1a", "Prkaa2", "Prkab1", "Prkab2", "Prkag1", "Prkag2", "Sardh", "Sdha", "Sdhb", "Sdhc", "Slc16a1", "Slc16a3", "Slc16a8", "Sod2", "Tfam", "Uqcr10", "Uqcr11", "Uqcrq")
+
+phagocytosis <- c("4933434E20Rik", "Abca1", "Abca7", "Abl1", "Abl2", "Abr", "Adgrb1", "Ager", "Ahsg", "Aif1", "Alox15", "Ano6", "Anxa1", "Anxa3", "Anxa11", "Apoa1", "Apoa2", "Appl2", "Arhgap12", "Arhgap25", "Arl8b", "Axl", "BC053393", "Bcr", "Becn1", "Bin2", "Bltp1", "Btk", "C2", "C3", "C4b", "C4bp", "Calr", "Camk1d", "Ccl2", "Ccr2", "Ccr7", "Cd36", "Cd47", "Cd209b", "Cd300lf", "Cd302", "Cdc42", "Cdc42se1", "Cdc42se2", "Cebpe", "Cfb", "Cfp", "Clcn3", "Clec7a", "Cln3", "Cnn2", "Colec10", "Colec11", "Colec12", "Coro1a", "Coro1c", "Cryba1", "Cyba", "Dnm2", "Dock1", "Dock2", "Dppa1", "Eif2ak1", "Elane", "Elmo1", "Elmo2", "Elmo3", "F2rl1", "Fcer1g", "Fcgr1", "Fcgr2b", "Fcgr3", "Fgr", "Fpr2", "Fpr3", "Fpr-rs3", "Fpr-rs4", "Fpr-rs6", "Fpr-rs7", "Gas6", "Gata2", "Gm5150", "Gm12169", "Gsn", "Gulp1", "Havcr1", "Hck", "Hmgb1", "Icam5", "Ifng", "Igh-8", "Ighg1", "Ighg2a", "Ighg2b", "Il1b", "Il2rb", "Il2rg", "Il15", "Il15ra", "Irf8", "Itga2", "Itgal", "Itgam", "Itgav", "Itgb1", "Itgb2", "Itgb3", "Jmjd6", "Klrh1", "Lbp", "Ldlr", "Lep", "Lepr", "Letmd1", "Lman2", "Lrp1", "Lyar", "Lyst", "Marco", "Masp1", "Masp2", "Mbl1", "Mbl2", "Megf10", "Mertk", "Mesd", "Met", "Mex3b", "Mfge8", "Msr1", "Mst1r", "Myd88", "Myh9", "Myo1g", "Myo7a", "Myo18a", "Ncf2", "Ncf4", "Nckap1l", "Nfix", "Nod2", "Nr1h3", "P2rx7", "P2ry6", "Pear1", "Pecam1", "Pik3ca", "Pikfyve", "Pip5k1c", "Pla2g5", "Plcg2", "Pld4", "Pot1b", "Pparg", "Prkcg", "Pros1", "Ptk2", "Ptprc", "Ptprj", "Ptx3", "Pycard", "Rab5a", "Rab7", "Rab7b", "Rab11fip2", "Rab14", "Rab20", "Rab27a", "Rab31", "Rab34", "Rab39", "Rac1", "Rac3", "Rap1a", "Rap1gap", "Rapgef1", "Rara", "Scarb1", "Sftpa1", "Sftpd", "Sh3bp1", "Siglece", "Sirpa", "Sirpb1a", "Sirpb1b", "Sirpb1c", "Sirpd", "Slamf1", "Slc11a1", "Sod1", "Spg11", "Sphk1", "Spon2", "Srpx", "Stap1", "Syk", "Syt7", "Tafa4", "Tgm2", "Thbs1", "Ticam2", "Timd2", "Timd4", "Tlr4", "Tm9sf4", "Tmem175", "Tnf", "Trem2", "Treml4", "Trex1", "Tub", "Tulp1", "Tusc2", "Tyro3", "Tyrobp", "Unc13d", "Vamp7", "Vav1", "Washc5", "Xkr4", "Xkr5", "Xkr6", "Xkr7", "Xkr8", "Xkr9", "Zp3r")
+
+neg_phagocytosis <- c( "Adipoq", "Appl1", "Atg3", "Atg5", "Atg7", "Cd47", "Cd300a", "Cd300lf", "Cnn2", "Csk", "Dysf", "Fcgr2b", "Fer1l5", "Hmgb1", "Pip4p2", "Prtn3", "Pten", "Rack1", "Sftpd", "Siglece", "Sirpa", "Snx3", "Syt11", "Tgfb1", "Tlr2")
+
+m2 <- c("Arg1", "Arg2", "Il10", "Fcgr2a", "Cd163", "Fcer2", "Cd200r1", "Pdcd1lg2", "Cd274", "Macro", "Csf1r", "Mrc1", "Il1rn", "Il1r2", "Il4r", "Ccl4", "Ccl13", "Ccl20", "Ccl17", "Ccl18", "Ccl22", "Ccl24", "Lyve1", "Vegfa", "Vegfb", "Vegfc", "Vegfd", "Egf", "Ctsa", "Ctsb", "Cst3", "Ctsd", "Tgfb1", "Tgfb2", "Tgfb3", "Mmp14", "Mmp19", "Mmp9", "Clec7a", "Wnt7b", "Faslg", "Tnfsf2", "Tnfsf8", "Cd276", "Vtcn1", "Msr1", "Fn1", "Irf4", "Ptprc", "Cd68", "Csf1r", "Ly75", "Cd14")
+
+other_list <- c("Ccnd2", "Ccne1", "Cd44", "Cxcr4", "E2f3", "Edn1", "Ezh2", "Fgf18", "Fgfr1", "Fyn", "Hey1", "Itgav", "Jag1", "Jag2", "Mmp9", "Notch1", "Pdgfa", "Ptk2", "Spp1", "Stc1", "Tnfaip6", "Tymp", "Vav2", "Vcan", "Vegfa")
+
+MHC2<- c("H2-Aa", "H2-Ab1",  "H2-DMa", "H2-DMb1", "H2-DMb2","H2-Eb1", "H2-M3", "H2-Ob", "H2-Q10",  "H2-T23","Cd74")
+
+#Heatmaps of the gene lists----
+for (i in c("glycolysis", "tca_oxphos", "phagocytosis", "neg_phagocytosis", "m2", "other_list", "MHC2")) {
+c <- intersect(rownames(DATA_Myeloid[["RNA"]]@data), get(i))
+DATA_Myeloid2<- ScaleData(DATA_Myeloid, features = c)
+ord_all <- factor(sapply(c,function(x){getcluster(DATA_Myeloid2, x, "seurat_subclusters")}))
+d<-c[order(as.character(ord_all) )]
+print(DoHeatmap(DATA_Myeloid2, group.by = "seurat_subclusters",features = d)+
+ theme(axis.text.y = element_text(size = 2)) + ggtitle(i))
+}
+
+#Module scores----
+DATA_Myeloid <- AddModuleScore(DATA_Myeloid,features = list(intersect(rownames(DATA_Myeloid), neg_phagocytosis)),name = "Phagocytosis.Score")
+DATA_Myeloid <- AddModuleScore(DATA_Myeloid,features = list(intersect(rownames(DATA_Myeloid), m2)),name = "m2.Score")
+FeaturePlot(DATA_Myeloid, features = "Phagocytosis.Score1",repel = TRUE)+ scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu"))) + ggtitle("Negative Phagocytosis Regulate Score")
+
+VlnPlot(DATA_Myeloid, features = "Phagocytosis.Score1",group.by = "seurat_subclusters",split.by = "Condition",pt.size = 0)
+DotPlot(DATA_Myeloid,features = "Phagocytosis.Score1",group.by = "seurat_subclusters",split.by = "Condition")
+
+plot_grid(FeaturePlot(DATA_Myeloid, features = "Phagocytosis.Score1",repel = TRUE)+ scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu"))), FeaturePlot(DATA_Myeloid, features = "m2.Score1",repel = TRUE)+ scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu"))))
+
+#Difference between 7 and 8----
+DATA_Myeloid <- SetIdent(DATA_Myeloid, value = "seurat_subclusters")
+genes <- FindMarkers(DATA_Myeloid,
+                     ident.1 = "7",
+                     ident.2 = "8",
+                     log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+genes<- genes[ genes$p_val < 0.05,  ]
+genes$pct.diff <- genes$pct.1 - genes$pct.2
+genes$log.pct.diff <- log2(genes$pct.1 / (genes$pct.2+0.01) )
+
+plot_dots(DATA_Myeloid,genes = row.names( genes[genes$pct.diff>0.8,]), clustering = "seurat_subclusters")
+VlnPlot(DATA_Myeloid, features = c("B2m","Cd68","Fth1","Ftl1","Ubb","Ccl5","Ccl3","Ptprc","Ifngr1","Fcer1g","Spp1","Gpnmb","Mrc1","Vim","Ly6a","Cd83","Clec7a"), pt.size = 0)
+plot_dots(DATA_Myeloid, genes = c("B2m","Cd68","Fth1","Ftl1","Ubb","Ccl4","Ccl3","Mrc1","Ms4at","Ccr1","Dab2","Pf4","Stab1","Cbr2","Cd163","P2ry12","Tmem119"), clustering = "seurat_subclusters")
+
+
+#DEGs for Clusters----
+DATA_Myeloid <- SetIdent(DATA_Myeloid, value = "seurat_subclusters")
+DefaultAssay(DATA_Myeloid) <-  "RNA"
+
+detable_all <- FindAllMarkers(DATA_Myeloid, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.3, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+
+plot_dots(DATA_Myeloid, genes = c( as.character(unique(top20_all$gene)),
+                                   "Cd86","Cd36","Clec7a","Itgax","Adgre1","Itgam","Ptprc","Ly6c","Ly6g","Fmn1", "Mrc1","Tmem119","P2ry12","Cd80","B2m"
+                                   ),main = "Myeloid Cells",assay = "RNA",clustering = "seurat_subclusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+write.csv(top20_all, file = "results/cell/Myeloid/Myeloid_Markers_top20.csv")
+write.csv(detable_all, file = "results/cell/Myeloid/Myeloid_Markers_All.csv")
+write.csv(top5_all, file = "results/cell/Myeloid/Myeloid_Markers_top5.csv")
+
+FeaturePlot(DATA_Myeloid, features = c("Ptprc","Mrc1","Lpl"), order = T) + NoAxes()
+
+pdf("results/cell/Myeloid/Microglia_marker.pdf", width = 10,height = 7)
+VlnPlot(DATA_Myeloid,features = c("P2ry12","Tmem119", "Hexb", "Cx3cr1","Fcrls","Sall1","C1qa","C1qb", "C1qc","Itgam","Siglech", "Gpr34",  "Ccr2","Ly6c1","Ly6c2","Mrc1","Arg1"),group.by="seurat_subclusters",pt.size = 0, stack = T, flip = T)
+dev.off()
+
+VlnPlot(DATA_Myeloid,features = c( "Alox15"),group.by="seurat_subclusters",pt.size = 0)
+
+#GSEA Analysis on each clusters----
+TERM2GENE <- getTERM2GENE(GSEA_Type = "GO:BP", Species = "mmusculus")
+KEGG <- getTERM2GENE(GSEA_Type = "KEGG", Species = "mmusculus")
+
+for (i in 0:8) {
+print(paste0("Cluster", i))
+geneList <- detable_all[detable_all$cluster == i,]$avg_log2FC
+names(geneList)=detable_all[detable_all$cluster == i,]$gene
+
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE =KEGG,
+            pvalueCutoff = 0.1)
+
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Myeloid/Myeloid_GSEA.xlsx", sheetName = paste0("GSEA_KEGG_Cluster",i), append = TRUE)
+}
+
+#DotPlot for GSEA----
+geneList <- detable_all[detable_all$cluster == 2,]$avg_log2FC
+names(geneList)=detable_all[detable_all$cluster == 2,]$gene
+
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE = KEGG,
+            pvalueCutoff = 0.1,scoreType = "pos")
+
+barplot.enrichResult(GOBP, color = "p.adjust", showCategory=c("KEGG_OXIDATIVE_PHOSPHORYLATION", "KEGG_HUNTINGTONS_DISEASE", "KEGG_PARKINSONS_DISEASE", "KEGG_ALZHEIMERS_DISEASE")
+, font.size = 10, title = "Myeloid_2 GSEA KEGG")
+
+dotplot(GOBP, color = "p.adjust", showCategory=c("KEGG_OXIDATIVE_PHOSPHORYLATION", "KEGG_HUNTINGTONS_DISEASE", "KEGG_PARKINSONS_DISEASE", "KEGG_ALZHEIMERS_DISEASE")
+, size = "GeneRatio", x="NES",font.size = 10, title = "Myeloid_2 GSEA KEGG"
+        )
+
+# Geneoncology on each clusters----
+for(i in 0:8){
+print(paste0("Current Cluster is ",i))
+genelist=detable_all[detable_all$cluster == i,]$gene
+go = gost(genelist, organism = 'mmusculus')
+
+write.xlsx(as.data.frame(go$result[, c("term_name","p_value", "intersection_size", "term_size","term_id", "source")]), file = "results/cell/Myeloid/Myeloid_GO.xlsx", sheetName = paste0("GO_Cluster ",i), append = TRUE)
+
+htmlwidgets::saveWidget(as_widget(gostplot(go,interactive = T)%>% layout(title = paste0("Cluster ", i))), paste0("results/cell/Myeloid/Cluster ",i," GO.html"))
+}
+```
+
+```{r Myeloid Cells between conditions}
+VlnPlot(DATA_Myeloid,features = c("Ptprc","Itgam","Cx3cr1","Hif1a","Gapdh","B2m","Epas1"),group.by="seurat_subclusters",split.by = "Condition")
+DotPlot(DATA_Myeloid,features = c("Ptprc","Itgam","B2m","Tnf"),group.by = "seurat_subclusters" ,split.by = "Condition")+ coord_flip()
+
+
+#DEGs for Condition----
+DATA_Myeloid <- SetIdent(DATA_Myeloid, value = "Condition")
+DefaultAssay(DATA_Myeloid) <-  "RNA"
+
+detable_all <- FindAllMarkers(DATA_Myeloid, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(detable_all, file = "results/cell/Myeloid/Myeloid_ConditionMarkers_All.csv")
+
+plot_dots(DATA_Myeloid, genes = c( as.character(unique(top20_all$gene))),main = "Myeloid Cells",assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+
+#GSEA Analysis on each condition----
+for (i in c("PBS","AEC")) {
+print(paste0("Condition", i))
+geneList <- detable_all[detable_all$cluster == i,]$avg_log2FC
+names(geneList)=detable_all[detable_all$cluster == i,]$gene
+
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE =KEGG,
+            pvalueCutoff = 1)
+
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Myeloid/Myeloid_GSEA.xlsx", sheetName = paste0("GSEA_KEGG_Condition",i), append = TRUE)}
+
+# Geneoncology on each condition----
+for (i in c("PBS","AEC")) {
+print(paste0("Current Condition is ",i))
+genelist=detable_all[detable_all$cluster == i,]$gene
+go = gost(genelist, organism = 'mmusculus')
+
+write.xlsx(as.data.frame(go$result[, c("term_name","p_value", "intersection_size", "term_size","term_id", "source")]), file = "results/cell/Myeloid/Myeloid_GO.xlsx", sheetName = paste0("GO_Condition ",i), append = TRUE)
+
+htmlwidgets::saveWidget(as_widget(gostplot(go,interactive = T)%>% layout(title = paste0("Condition ", i))), paste0("results/cell/Myeloid/Condition ",i," GO.html"))
+}
+
+
+#split each cluster with Condition ----
+DATA_Myeloid$Con_sub <- paste0(DATA_Myeloid$seurat_subclusters,"_",DATA_Myeloid$Condition)
+DATA_Myeloid <- SetIdent(DATA_Myeloid, value = "Con_sub")
+for (a in 0:8){
+  print(paste0("Current Cluster is ", a))
+  ident.1 = paste0(a ,"_PBS")
+  ident.2 = paste0(a ,"_AEC")
+  detable_all <- FindMarkers(DATA_Myeloid,
+                             ident.1 = ident.1,
+                             ident.2 = ident.2,
+                             log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+print(paste0("Current GSEA is for Cluster ", a))
+geneList <- detable_all$avg_log2FC
+names(geneList)=rownames(detable_all)
+
+geneList=sort(geneList,decreasing = T)
+
+GOBP <-GSEA(geneList, TERM2GENE =TERM2GENE,
+            pvalueCutoff = 0.1)
+
+write.xlsx(as.data.frame(GOBP@result), file = "results/cell/Myeloid/Myeloid_GSEA.xlsx", sheetName = paste0("GSEA_GOBP_",a), append = TRUE)
+}
+DATA_Myeloid <- SetIdent(DATA_Myeloid, value = "seurat_subclusters")
+
+
+#Check for glycolysis gene----
+plot_dots(DATA_Myeloid, genes = c("Hk1","Hk2","Hk3","Gck","Insr",#Hexokinase
+                                  "Slc2a1","Slc2a2","Slc2a3","Slc2a4","Slc2a6","Slc2a5","Slc2a7","Slc2a8","Slc2a9","Slc2a10","Slc2a11","Slc2a12","Slc2a13","Slc2a14",
+                                  "Gpi", # Glucose-6-phosphate isomerase
+                                  "Pfkm","Pfkp","Pfkfb1","Pfkfb2","Pfkfb3", #Phosphofructokinase
+                                  "Aldoa","Aldob","Aldoc", #Aldolase
+                                  "Tpi1", #Triose phosphate isomerase
+                                  "Gapdh",#Glyceraldehyde- 3-phosphate dehydrogenase
+                                  "Pgk1","Pgk2", #Phosphoglycerate kinase
+                                  "Pgam1","Pgam2","Pgam3","Pgam4","Pgam5", #Phosphoglycerate mutase
+                                  "Eno1","Eno2","Eno3","Eno4", #Enolase
+                                  "Pklr","Pkm", #Pyruvate kinase,
+                                  "Pdk1","Pdk2","Pdk3","Pdk4", #Pyruvate dehydrogenase
+                                  "Adh1","Adh2","Adh5","Adh7", #Alchohol dehydrogenase
+                                  "Ldha","Ldhb","Ldhc","Ldhd",
+                                  "Acly", #Citrate synthase
+                                  "Aco2", #Aconitase
+                                  "Mdh1","Mdh2",#Malate dehydrogenase
+                                  "Dmac2l","Atpsckmt","Atp5d",
+                                  "Acox3", "Acox1", "Cox4i1", "Cox8a", "Cox6c", "Cox6b1", "Cox7c", "Cox7b", "Msr1","Lrp1",
+                                  "Cpt1a","Cpt1b","Acaca","Acacb","Fasn","Il1b","Tnf","Ccl2","Ccl5","Ifng"
+),assay = "RNA",clustering = "seurat_subclusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+plot_dots(DATA_Myeloid, genes = c("Hk2",#Hexokinase
+                                  "Pfkfb3", #Phosphofructokinase
+                                  "Pdk1",
+                                  "Insr","Gsk3b","Lrp1",
+                                  "Tgfbr1","Tgfbr2",
+                                  "Fcho2", "Fchsd2","Acox3", "Acox1", "Stat1","Ccl2",
+                                  "Aldoa", #Aldolase
+                                  "Tpi1", #Triose phosphate isomerase
+                                  "Gapdh",#Glyceraldehyde- 3-phosphate dehydrogenase
+                                  "Pgk1", #Phosphoglycerate kinase
+                                  "Pgam1", #Phosphoglycerate mutase
+                                  "Eno1", #Enolase
+                                  "Ldha","Ldhb", "Fcgr2b","Atp5d",
+                                  "Cox4i1", "Cox8a", "Cox6c", "Cox6b1", "Cox7c", "Cox7b",
+                                  "Ccl5", "Fcer1g", "Fcgr1","Cx3cr1","Cst7","Ctsb","Apoe"
+),assay = "RNA",clustering = "seurat_subclusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+#Cholesterol metabolism----
+plot_dots(DATA_Myeloid, genes = c("Hmgcs1", "Hmgcr", "Mvk", "Pmvk", "Mvd", "Idi1", "Fdps", "Fdft1", "Sqle", "Lss", "Cyp51", "Dhcr24", "Sc5d", "Dhcr7",
+                                  "Abca1", "Abcg1", "Apoe", "Abcb11", "Abcg5", "Abcg8", "Acot1", "Angptl3", "Angptl4", "Angptl8", "Apoc1", "Apoh", "Cideb", "Cyp27a1",
+                                  "Lipg", "Lipc", "Mylip", "Lipa", "Ldlr", "Ldlrap1", "Lpl", "Lrp1", "Lrp2", "Lrpap1", "Nceh1", "Npc1", "Npc2", "Osbpl5", "Pcsk9",
+                                  "Soat1", "Sort1", "Scarb1", "Star", "Stard3", "Tspo",
+                                  "Trem2","Cxcl10","Nos2","Creb1","Creb5","Crtc3"),
+          assay = "RNA",clustering = "seurat_subclusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+plot_dots(DATA_Myeloid, genes = c("Mertk","Hk2","Pfkfb3","Abca1","Abcg1","Insr","Igf1r","Gsk3b","Mtor","Tgfbr1","Tgfbr2","Mapk1","Mapk6","Smad2","Smad3","Smad7","Nfkb1","Cd274","Sirt1"),clustering = "seurat_subclusters",assay = "RNA",pal = c("#cfc8d7","#a577f2", "#0434ff"), show_grid = F)
+VlnPlot(DATA_Myeloid,features = c("Mertk","Axl"),group.by = "seurat_subclusters",ncol = 1,pt.size = 0.01)
+#DAM
+plot_dots(DATA_Myeloid, genes = c("Trem2","Apoe","Lpl","Cst7","Spp1","Clec7a","Cxcl9","Itgax"),clustering = "seurat_subclusters",assay = "RNA",pal = c("#cfc8d7","#a577f2", "#0434ff"), show_grid = F)
+#B2m low
+VlnPlot(DATA_Myeloid, c("Ptprc","Itgam","B2m"), group.by = "seurat_subclusters" ,pt.size = 0)
+VlnPlot(DATA_Myeloid, c("Mrc1","Arg1"), group.by = "seurat_subclusters" ,pt.size = 0)
+
+plot_dots(DATA_Myeloid, genes = c("Ptprc","Itgam","B2m","Smad2","Smad3","Samd4","Smad7","Pparg","Nfkb1","Nfkb2","Mapkapk3","Mapk1","Mapk6"),clustering = "seurat_subclusters")
+VlnPlot(DATA_Myeloid, c("Ptprc","Itgam","B2m","Cd274"), group.by = "seurat_subclusters", split.by = "Condition" ,pt.size = 0)
+
+#PD-L1 in immune cells
+DATA_Immune$Condition <- factor(x = DATA_Immune$Condition, levels = c("PBS","AEC"))
+plot_grid(
+DotPlot(DATA_Immune, features = c("Cd274"), group.by = "Celltypes", split.by = "Condition")+coord_flip() + RotatedAxis(),
+VlnPlot(DATA_Immune, features = c("Cd274"), group.by = "Celltypes", split.by = "Condition",pt.size = 0)+ ggtitle("PD-L1"), ncol = 1)
+
+#Antigen presentation
+plot_dots(DATA_Myeloid, genes = c("Anxa4", "Batf3", "Bcl10", "Calr", "Cd1d2", "Cd209e", "Cd36", "Cd74", "Cd83", "Cdc20", "Clec7a", "Ctsa", "Ctsd", "Ctsg", "Ctsl", "Ctss", "Cybb", "Fbxl7", "Fcgr1", "Fyn", "H2-Aa", "H2-Ab1", "H2-D1", "H2-DMa", "H2-DMb1", "H2-DMb2", "H2-Ea-ps", "H2-Eb1", "H2-K1", "H2-M3", "H2-Ob", "H2-Q1", "H2-Q10", "H2-Q2", "H2-T23", "Hras", "Ifng", "Il1b", "Kif20a", "Lamp3", "Lst1", "Malt1", "Map3k14", "Mrc1", "Mrc2", "Ncf2", "Nfatc1", "Nfatc2", "Nfkb1", "Nfkbia", "Nfyc", "Psmb8", "Psmb9", "Psme2", "Pycard", "Raf1", "Socs1", "Socs3", "Syk", "Tap1", "Tap2", "Tapbp", "Tnf", "Traf6", "Trim9", "Tuba1a", "Tuba4a","Smad2","Smad3","Samd4","Smad7","Pparg")
+,assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+#MHC
+VlnPlot(DATA_Myeloid, features = c("H2-D1","H2-K1","H2-M3","H2-T3","H2-T23","B2m","H2-Aa", "H2-Ab1",  "H2-DMa", "H2-DMb1",  "H2-Ea", "H2-Eb1", "Cd74"),stack = T, group.by = "Condition", pt.size = 0,flip = T)+NoLegend()
+plot_dots(DATA_Myeloid, genes = c("Hk2","H2-D1","H2-K1","H2-Aa", "H2-Ab1",  "H2-DMa", "H2-DMb1" ,"H2-Eb1",  "H2-T23", "H2-Q1","H2-M3","Cd74","H2-DMb2", "H2-Q10","H2-Ob"),assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+VlnPlot(DATA_Myeloid, features = c("H2-D1","H2-K1","H2-Aa", "H2-Ab1",  "H2-DMa", "H2-DMb1" ,"H2-Eb1",  "H2-T23", "H2-Q1","H2-M3","Cd74","H2-DMb2", "H2-Q10","H2-Ob"),group.by = "seurat_subclusters", split.by = "Condition")
+
+#Myeloid cell type markers
+plot_dots(DATA_Myeloid, genes = c("C1qa","Adgre1","Fcgr1","Csf1r","Flt3","Ly6c2","Ace","Ccr2","Chil3","Eno3","H2-Aa",
+                                 "P2ry12","Tmem119","Clec7a", "Zbtb46","Ccr7","Nudt17","Cacnb3","Itgax","Itgam","Itgae","Xcr1","Irf8",
+                                  "Ly6g","Ngp","Camp","S100a9",
+                                  "Cd3e","Gata3","Il1rl1","Hs3st1","Rnf128","Il2ra","Sirt1",
+                                  "Pax5"),assay = "RNA",clustering = "seurat_subclusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+plot_dots(DATA_Myeloid, genes = c( "Mki67","Top2a",
+  "P2ry12", "Ly6c1","Ly6c2","Cd209a","Ceacam1","Ccr2","Sell","Cx3cr1","Spn","Ccr5","Fcgr3","Cxcr2","Cxcr4","S100a8","Ccr7","Flt3","Xcr1","Ly6g","Siglech","Itgax","Mertk","Axl", "Apoe"
+  ),assay = "RNA",clustering = "seurat_subclusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+#Microglia Signiture
+plot_dots(DATA_Myeloid, genes = c("Fcrls","Trem2","Hexb","Olfml3","Gpr34","Tmem119","P2ry12","Siglech","Golm1","Sall1","Adgrg1","Slc2a5","Serpine2","Sparc","Adamts1","Mki67","Top2a","Ptprc","Itgam","Cd74","Mrc1","Tgfb1","Stat6","Pparg", "Arg1","Ly6c2","Mertk","Cd63","Lyve1","Adgre1","Tgfbr2","Epas1","Cd274"),assay = "RNA",clustering = "seurat_subclusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+FeaturePlot(DATA_Myeloid, c("Top2a","Mki67"))
+FeaturePlot(DATA_Myeloid, c("Apoe","P2ry12","Ptprc","Tgfbr2"))
+FeaturePlot(DATA_Myeloid, c("Ptprc","Tgfbr2","Tgfb1","Mertk", "Top2a"))
+plot_dots(DATA_Myeloid, genes = c("Ptprc","Tgfbr1","Tgfbr2","Tgfb1","Mertk","Cd86","Ccl3","Il1b","Tnf","Mrc1","Cd80","Il1rl1","Il4","Il6","Il10","H2-K1","H2-D1","H2-Aa","H2-Eb1","Hif1a","Cd14","Gsk3b","Igf1r","Insr","Cd63","Cd81", "Clec7a","Spp1","Cst7","Lpl","Lair1","Apoe","Gpnmb","Arg1","Cx3cr1","Cd40","Foxo1","Mtor","Tspo","Hk2","Trem2","Axl","Arntl","Per1","Per2","Npas2","Cry1","Cry2","Plin2"),assay = "RNA",clustering = "seurat_subclusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+
+#Mrc1+ cells----
+DATA_Mrc <- subset(DATA_Myeloid, idents = c("7","8"))
+DefaultAssay(DATA_Mrc) <- "CCA"
+DATA_Mrc <- ScaleData(DATA_Mrc, features = rownames(DATA_Mrc))
+DATA_Mrc <- RunPCA(DATA_Mrc, npcs = 30)
+DATA_Mrc <- RunUMAP(DATA_Mrc, dims = 1:30)
+
+DimPlot(DATA_Mrc, group.by = "Condition")
+DATA_Mrc <- FindNeighbors(DATA_Mrc, dims = 1:30, k.param =7)
+
+for (res in c(0.1, 0.15,0.16,0.17,0.18,0.2,0.25,0.3,0.35,0.4,0.45, 0.5,0.55,0.6,0.65,0.75, 1,1.25, 1.5,1.75, 2,2.25, 2.5,3)) {
+  print(paste0("current res", res))
+    DATA_Mrc <- FindClusters(DATA_Mrc, graph.name = "CCA_snn", resolution = res, algorithm = 1)
+}
+
+clustree(DATA_Mrc@meta.data, prefix = "CCA_snn_res.")
+DATA_Mrc <- SetIdent(DATA_Mrc, value = "CCA_snn_res.0.1")
+DATA_Mrc$seurat_subclusters <- DATA_Mrc$CCA_snn_res.0.1
+DimPlot(DATA_Mrc,label = T)
+DefaultAssay(DATA_Mrc) <- "RNA"
+genes <- FindAllMarkers(DATA_Mrc,
+                     log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+genes<- genes[ genes$p_val < 0.05,  ]
+genes$pct.diff <- genes$pct.1 - genes$pct.2
+genes$log.pct.diff <- log2(genes$pct.1 / (genes$pct.2+0.01) )
+
+plot_dots(DATA_Mrc,genes = unique(genes$gene[genes$pct.diff>0.8]), clustering = "seurat_subclusters")
+```

@@ -1,0 +1,255 @@
+---
+title: "scRNA-seq PBS vs AEC: cell-cell communication"
+author: "Yuxi"
+date: "2022-11-24"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+Single cell RNA-seq of one PBS-treated and one AEC-treated mouse. Ambient RNA was removed with CellBender.
+This script was written for Seurat v4. To run it with Seurat v5, keep `options(Seurat.object.assay.version = "v3")` in the setup chunk.
+
+Immune subtypes for cell-cell communication, CellChat and LIANA in PBS and AEC.
+Starts from the objects in `data/cell/` saved by `01_QC_integration_annotation.Rmd`. `data/cell/Cell_Myeloid2.rds` is saved by `02_myeloid_cells.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load all the packages}
+library(tidyverse)
+library(Matrix)
+library(Seurat)
+options(Seurat.object.assay.version = "v3")
+
+library(cowplot)
+library(clustree)
+library(niceRplots)
+library(scCustomize)
+library(harmony)
+library(geomtextpath)
+library(webr)
+library(ComplexHeatmap)
+library(RColorBrewer)
+
+#For preprocessing
+library(DoubletFinder)
+
+#For Cell interaction
+library(CellChat)
+library(liana)
+
+#For enrichment Analysis
+library(correlationAnalyzeR)
+library(clusterProfiler)
+library(xlsx)
+library(gprofiler2)
+library(plotly)
+library(DOSE)
+
+#For transcriptional factor network
+library(loomR)
+
+#For Trajectory imputation
+library(slingshot)
+library(tradeSeq)
+library(fields)
+library(rafalib)
+
+for (d in c("data/cell", "results/cell/Myeloid", "results/cell/Myeloid/Trajectory", "results/cell/Mast", "results/cell/Tcell", "results/cell/Bcell", "results/cell/DC", "results/cell/Neutrophil", "results/cell/Cellchat", "results/cell/LIANA", "results/cell/SCENIC")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+
+```{r Data to do interaction}
+DATA_Immune <- readRDS("data/cell/Cell_Immune.rds")
+DATA_Immune <- SetIdent(DATA_Immune, value = "Celltypes")
+
+#Myeloid Cells----
+DATA_Myeloid <- readRDS("data/cell/Cell_Myeloid2.rds")
+DATA_Myeloid$Subtypes <- paste0("Myeloid_",DATA_Myeloid$seurat_subclusters)
+
+#B Cells----
+# CCA_snn_res.0.1 here is the clustering of the whole dataset, not the B cell subclustering
+DATA_B <- subset(DATA_Immune, idents = c("B Cell"))
+DATA_B$Subtypes <- paste0("B_",DATA_B$CCA_snn_res.0.1)
+
+#Other immune cells keep their cell type----
+DATA_Other <- subset(DATA_Immune, idents = c("Mast Cell", "T Cell", "Neutrophil", "Dendritic Cells"))
+DATA_Other$Subtypes <- DATA_Other$Celltypes
+
+#Merge the Data----
+DATA_immune2 = merge(DATA_Myeloid, c(DATA_B, DATA_Other))
+table(DATA_immune2$Celltypes,DATA_immune2$Subtypes)
+#Save the DATA----
+saveRDS(DATA_immune2,"data/cell/Cell_Immune_sub.rds" )
+
+```
+
+```{r Cellchat}
+#load the Dataset with Subtypes
+DATA <- readRDS("data/cell/Cell_Immune_sub.rds" )
+table(DATA$Celltypes,DATA$Subtypes)
+
+DATA_PBS <-SetIdent(DATA, value = "Condition") %>% subset(idents = "PBS")
+DATA_PBS <- NormalizeData(DATA_PBS)
+DATA_AEC <-SetIdent(DATA, value = "Condition") %>% subset(idents = "AEC")
+DATA_AEC <- NormalizeData(DATA_AEC)
+
+#Set the database to be used----
+CellChatDB <- CellChatDB.mouse
+showDatabaseCategory(CellChatDB)
+# use all CellChatDB for cell-cell communication analysis
+CellChatDB.use <- CellChatDB # simply use the default CellChatDB
+
+# Remove the warning (ligands not in the mouse genome)----
+CellChatDB.use[["interaction"]] <- CellChatDB.use[["interaction"]][!CellChatDB.use[["interaction"]]$ligand %in% c("H2-BI", "H2-Ea-ps"),]
+
+#PBS group----
+#Make CellChat object from Seurat
+data.input <- LayerData(DATA_PBS, assay = "RNA", layer  = "data") # normalized data matrix
+labels <-SetIdent(DATA_PBS, value = "Subtypes") %>% Idents()
+meta <- data.frame(group = labels, row.names = names(labels)) # create a dataframe of the cell labels
+cellchat_PBS <- createCellChat(object = data.input, meta = meta, group.by = "group")
+# set the used database in the object
+cellchat_PBS@DB <- CellChatDB.use
+# subset the expression data of signaling genes for saving computation cost
+cellchat_PBS <- subsetData(cellchat_PBS) # This step is necessary even if using the whole database
+cellchat_PBS <- identifyOverExpressedGenes(cellchat_PBS)
+cellchat_PBS <- identifyOverExpressedInteractions(cellchat_PBS)
+cellchat_PBS <- computeCommunProb(cellchat_PBS)
+# Filter out the cell-cell communication if there are only few number of cells in certain cell groups
+cellchat_PBS <- filterCommunication(cellchat_PBS, min.cells = 10)
+cellchat_PBS <- computeCommunProbPathway(cellchat_PBS)
+cellchat_PBS <- aggregateNet(cellchat_PBS)
+
+#AEC group----
+#Make CellChat object from Seurat
+data.input <- LayerData(DATA_AEC, assay = "RNA", layer  = "data") # normalized data matrix
+labels <-SetIdent(DATA_AEC, value = "Subtypes") %>% Idents()
+meta <- data.frame(group = labels, row.names = names(labels)) # create a dataframe of the cell labels
+cellchat_AEC <- createCellChat(object = data.input, meta = meta, group.by = "group")
+# set the used database in the object
+cellchat_AEC@DB <- CellChatDB.use
+# subset the expression data of signaling genes for saving computation cost
+cellchat_AEC <- subsetData(cellchat_AEC) # This step is necessary even if using the whole database
+cellchat_AEC <- identifyOverExpressedGenes(cellchat_AEC)
+cellchat_AEC <- identifyOverExpressedInteractions(cellchat_AEC)
+cellchat_AEC <- computeCommunProb(cellchat_AEC)
+cellchat_AEC <- filterCommunication(cellchat_AEC, min.cells = 10)
+cellchat_AEC <- computeCommunProbPathway(cellchat_AEC)
+cellchat_AEC <- aggregateNet(cellchat_AEC)
+
+saveRDS(list(PBS = cellchat_PBS, AEC = cellchat_AEC), "results/cell/Cellchat/cellchat_objects.rds")
+
+#Celltypes circle graph----
+for (cc in c("PBS", "AEC")) {
+cellchat <- get(paste0("cellchat_", cc))
+groupSize <- as.numeric(table(cellchat@idents))
+mat <- cellchat@net$weight
+pdf(file = paste0("results/cell/Cellchat/", cc, "_celltypes.pdf"), width = 12, height =10 )
+par(mfrow = c(3,5), xpd=TRUE, mar=c(1,1,1,1))
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])}
+dev.off()
+
+#circle graph with pathway----
+pdf(file = paste0("results/cell/Cellchat/", cc, "_pathway.pdf"), width = 9, height =16 )
+par(mfrow = c(5,3), xpd=TRUE, mar=c(1,1,1,1))
+for(i in cellchat@netP$pathways){
+netVisual_aggregate(cellchat, signaling = i, layout = "circle")
+}
+dev.off()
+
+#Chord graph for pathway----
+pdf(file = paste0("results/cell/Cellchat/", cc, "_Chord.pdf"), width = 9, height =16 )
+par(mfrow = c(5,3), xpd=TRUE, mar=c(1,1,1,1))
+for(i in cellchat@netP$pathways){
+netVisual_aggregate(cellchat, signaling = i, layout = "chord")
+}
+dev.off()
+}
+
+par(mfrow = c(1,2), xpd=T)
+netVisual_chord_gene(cellchat_PBS, sources.use = c(1:15), targets.use = 12, legend.pos.x = 15)
+netVisual_chord_gene(cellchat_AEC, sources.use = c(1:15), targets.use = 12, legend.pos.x = 15)
+
+plot_grid(
+netVisual_bubble(cellchat_PBS, sources.use = c(1:16), targets.use = c(2,3,5), remove.isolate = T),
+netVisual_bubble(cellchat_AEC, sources.use = c(1:16), targets.use = c(2,3,5), remove.isolate = T))
+
+netVisual_bubble(cellchat_PBS, sources.use = c(1:15), targets.use = c(12),signaling = c("MHC-II"), remove.isolate = FALSE)
+
+#Signal network of each pathway in PBS and AEC----
+pathways.show <- c("GALECTIN", "TGFb", "APP", "CCL", "MIF", "SPP1", "SEMA4", "CSF", "FN1", "ICAM", "CD52", "CD45", "MHC-II", "CD86", "JAM", "VISFATIN", "COMPLEMENT", "PROS", "CADM", "GRN", "PTPRM", "GAS", "CD80", "THBS", "LAMININ", "PECAM1", "SELPLG", "TNF", "THY1", "ITGAL-ITGB2", "CD22", "CD48", "CD39", "IL4", "ICOS", "CXCL", "IL2", "VCAM", "KIT", "OSM", "SEMA7", "IGF", "NGL", "IL1", "IL6", "ALCAM", "CD6", "BAFF", "CD200", "VEGF", "NECTIN", "IL16", "CD96", "TWEAK", "CD226", "SN", "NRG", "PVR", "ACTIVIN", "PD-L1", "PDL2", "MHC-I", "SELL")
+pathways.show <- intersect(pathways.show, intersect(cellchat_PBS@netP$pathways, cellchat_AEC@netP$pathways))
+
+pdf(file ="results/cell/Cellchat/cellchat_signal.pdf", width = 18, height =40)
+par(mfrow = c(8,4))
+for (a in pathways.show){
+    netVisual_chord_cell(cellchat_PBS, signaling = a,  title.name = paste0(a, " signaling network in PBS"))
+    netVisual_chord_cell(cellchat_AEC, signaling = a,  title.name = paste0(a, " signaling network in AEC"))
+}
+dev.off()
+
+```
+
+```{r Liana}
+DATA <- readRDS("data/cell/Cell_Immune_sub.rds" )
+table(DATA$Celltypes,DATA$Subtypes)
+DATA_PBS <-SetIdent(DATA, value = "Condition") %>% subset(idents = "PBS")
+DATA_PBS <- NormalizeData(DATA_PBS) %>% SetIdent(value = "Subtypes")
+DATA_AEC <-SetIdent(DATA, value = "Condition") %>% subset(idents = "AEC")
+DATA_AEC <- NormalizeData(DATA_AEC) %>% SetIdent(value = "Subtypes")
+
+op_resource <- select_resource("Consensus")[[1]]
+
+# Generate orthologous resource
+ortholog_resource <- generate_homologs(op_resource = op_resource,
+                                       target_organism = 10090) # mouse
+
+# Run LIANA with the orthologous resource
+liana_PBS <- liana_wrap(DATA_PBS,
+                        resource = 'custom', # resource has to be set to 'custom' to work with external resources
+                        external_resource = ortholog_resource # provide orthologous resource
+                        )
+
+liana_AEC <- liana_wrap(DATA_AEC,
+                        resource = 'custom', # resource has to be set to 'custom' to work with external resources
+                        external_resource = ortholog_resource # provide orthologous resource
+                        )
+liana_PBS <- liana_PBS %>% liana_aggregate()
+liana_AEC <- liana_AEC %>% liana_aggregate()
+liana_PBS.f <-liana_PBS%>%filter(aggregate_rank <= 0.01)# only keep interactions concordant between methods
+liana_AEC.f <-liana_AEC%>%filter(aggregate_rank <= 0.01)# only keep interactions concordant between methods
+write.csv(liana_PBS, "results/cell/LIANA/liana_PBS.csv", row.names = FALSE)
+write.csv(liana_AEC, "results/cell/LIANA/liana_AEC.csv", row.names = FALSE)
+
+#frequency chord diagram
+par(mar = c(8,8,8,8))
+chord_freq(liana_PBS.f)
+chord_freq(liana_AEC.f)
+#frequency heatmap
+heat_freq(liana_PBS.f)
+heat_freq(liana_AEC.f)
+
+#Dotplot for each myeloid subcluster as source----
+for(i in paste0("Myeloid_", 0:8)){
+  print(i)
+a<-liana_dotplot(liana_PBS.f, source_groups = i,
+              target_groups = unique(liana_PBS$target)
+                ,ntop = 30) + theme(axis.text.x = element_text( size=10, angle=90), axis.text.y = element_text( size=10)) + ggtitle(paste0("PBS ",i))
+
+b<-liana_dotplot(liana_AEC.f, source_groups =i,
+              target_groups = unique(liana_AEC$target)
+              ,ntop = 30) + theme(axis.text.x = element_text( size=10, angle=90), axis.text.y = element_text( size=10))+ ggtitle(paste0("AEC ",i))
+pdf(file = paste0("results/cell/LIANA/",i,"_source.pdf"),height = 8, width = 20)
+print(plot_grid(a,b))
+dev.off()
+}
+```

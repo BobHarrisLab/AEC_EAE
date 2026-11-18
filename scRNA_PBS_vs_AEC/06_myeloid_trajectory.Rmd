@@ -1,0 +1,204 @@
+---
+title: "scRNA-seq PBS vs AEC: myeloid trajectory"
+author: "Yuxi"
+date: "2022-11-24"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+Single cell RNA-seq of one PBS-treated and one AEC-treated mouse. Ambient RNA was removed with CellBender.
+This script was written for Seurat v4. To run it with Seurat v5, keep `options(Seurat.object.assay.version = "v3")` in the setup chunk.
+
+Slingshot and tradeSeq on myeloid subclusters 0, 2, 4 and 5 in the AEC sample.
+Starts from `data/cell/Cell_Myeloid2.rds`, saved by `02_myeloid_cells.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load all the packages}
+library(tidyverse)
+library(Matrix)
+library(Seurat)
+options(Seurat.object.assay.version = "v3")
+
+library(cowplot)
+library(clustree)
+library(niceRplots)
+library(scCustomize)
+library(harmony)
+library(geomtextpath)
+library(webr)
+library(ComplexHeatmap)
+library(RColorBrewer)
+
+#For preprocessing
+library(DoubletFinder)
+
+#For Cell interaction
+library(CellChat)
+library(liana)
+
+#For enrichment Analysis
+library(correlationAnalyzeR)
+library(clusterProfiler)
+library(xlsx)
+library(gprofiler2)
+library(plotly)
+library(DOSE)
+
+#For transcriptional factor network
+library(loomR)
+
+#For Trajectory imputation
+library(slingshot)
+library(tradeSeq)
+library(fields)
+library(rafalib)
+
+for (d in c("data/cell", "results/cell/Myeloid", "results/cell/Myeloid/Trajectory", "results/cell/Mast", "results/cell/Tcell", "results/cell/Bcell", "results/cell/DC", "results/cell/Neutrophil", "results/cell/Cellchat", "results/cell/LIANA", "results/cell/SCENIC")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+
+```{r Slingshot}
+DATA_Myeloid <- readRDS("data/cell/Cell_Myeloid2.rds")
+
+#Trajectory of subclusters 0, 2, 4, 5 in AEC----
+DATA<-subset(DATA_Myeloid %>% SetIdent(value = "seurat_subclusters"), idents= c("0", "2",  "4", "5"))
+DATA<- subset(DATA %>% SetIdent(value = "Condition"), idents="AEC")
+DATA$seurat_subclusters <- droplevels(factor(DATA$seurat_subclusters))
+
+#Generate 3D Umap----
+DefaultAssay(DATA) <- "CCA"
+DATA <- ScaleData(DATA, features = rownames(DATA))
+DATA <- RunPCA(DATA, npcs = 30)
+DATA <- RunUMAP(DATA, dims = 1:30)
+DATA<- RunUMAP(DATA, dims = 1:30, n.components = 3, reduction.name = "umap_3d")
+DefaultAssay(DATA) <- "RNA"
+DimPlot(DATA, group.by = "seurat_subclusters")
+
+#Plot 3D----
+df <- data.frame(DATA@reductions$umap_3d@cell.embeddings, variable = factor(DATA$seurat_subclusters))
+colnames(df)[1:3] <- c("UMAP_1", "UMAP_2", "UMAP_3")
+p_State <- plot_ly(df, x = ~UMAP_1, y = ~UMAP_2, z = ~UMAP_3, color = ~variable, size = 0.5)
+htmlwidgets::saveWidget(p_State, selfcontained = T, "results/cell/Myeloid/Trajectory/umap_3d_clustering_plotly.html")
+p_State
+
+# Calculate cluster centroids (for plotting the labels later)----
+mm <- sparse.model.matrix(~0 + factor(DATA$seurat_subclusters))
+colnames(mm) <- levels(factor(DATA$seurat_subclusters))
+centroids2d <- as.matrix(t(t(DATA@reductions$umap@cell.embeddings) %*% mm)/Matrix::colSums(mm))
+pal <- c((scales::hue_pal())(8), RColorBrewer::brewer.pal(9, "Set1"), RColorBrewer::brewer.pal(8,"Set2"))
+
+#Trajectory imputation----
+set.seed(1)
+lineages <- as.SlingshotDataSet(getLineages(
+  data           = DATA@reductions$umap_3d@cell.embeddings,
+  clusterLabels  = DATA$seurat_subclusters,
+  start.clus     = "4"
+  ))
+
+#Plot Lineage
+lineages@reducedDim <- DATA@reductions$umap@cell.embeddings
+plot(DATA@reductions$umap@cell.embeddings, col = pal[DATA$seurat_subclusters],  cex=.5,pch = 16)
+lines(lineages, lwd = 1, col = 'black', cex=2 )
+text(centroids2d, labels = rownames(centroids2d),cex=0.8,font=2,col = "white")
+
+#Defining Principal Curves----
+curves <- as.SlingshotDataSet(getCurves(data = lineages, thresh = 0.01, stretch = 0.1, allow.breaks = F, approx_points = 1000))
+plot(DATA@reductions$umap@cell.embeddings, col = pal[DATA$seurat_subclusters], pch = 16)
+lines(curves, lwd = 2, col = "black")
+text(centroids2d, labels = rownames(centroids2d), cex = 1, font = 2)
+
+#Compute pseudotime----
+pseudotime <- slingPseudotime(curves, na = FALSE)
+cellWeights <- slingCurveWeights(curves)
+
+x <- rowMeans(pseudotime)
+x <- x/max(x)
+o <- order(x)
+pt_pal = colorRampPalette(c("grey70", "orange3", "firebrick", "purple4"))
+plot(DATA@reductions$umap@cell.embeddings[o, ], main = paste0("pseudotime"), pch = 16,
+    cex = 0.4, axes = T, xlab = "", ylab = "",col = pt_pal(99)[x[o] * 98 + 1])
+lines(curves, lwd = 2, col = "black")
+colorbar.plot( 5, 2.5,  1:99, horizontal = F,col = pt_pal(99))
+points(centroids2d, cex = 2.5, pch = 16, col = "#FFFFFF99")
+text(centroids2d, labels = rownames(centroids2d), cex = 1, font = 2)
+
+#plot pseudotime together with clusters
+par(mar = c(4,4,2,2), xpd = T, mfrow = c(1,2))
+plot(DATA@reductions$umap@cell.embeddings, col = pal[DATA$seurat_subclusters],  cex=.5,pch = 16)
+text(centroids2d, labels = rownames(centroids2d),cex=0.8,font=2,col = "black")
+legend("topright", legend = levels(DATA$seurat_subclusters), pch= 16,col  = pal[seq_along(levels(DATA$seurat_subclusters))],cex=0.8)
+plot(DATA@reductions$umap@cell.embeddings[o, ], main = paste0("pseudotime"), pch = 16,
+    cex = 0.4, axes = F, xlab = "", ylab = "", col = pt_pal(99)[x[o] * 98 + 1])
+
+
+#TradeSeq ----
+# 190 cells per subcluster
+sel_cells <- split(colnames(DATA), DATA$seurat_subclusters)
+sel_cells <- unlist(lapply(sel_cells, function(x) {set.seed(1)
+  return(sample(x, min(190, length(x))))}))
+
+gv <- as.data.frame(na.omit(scran::modelGeneVar(DATA@assays$RNA@data[, sel_cells])))
+gv <- gv[order(gv$bio, decreasing = T), ]
+sel_genes <- sort(rownames(gv)[1:2000])
+sceGAM <- fitGAM(counts = drop0(DATA@assays$RNA@counts[sel_genes, sel_cells]), pseudotime = pseudotime[sel_cells,
+    ], cellWeights = cellWeights[sel_cells, ], nknots = 5, verbose = T, parallel = T,
+    sce = TRUE, BPPARAM = BiocParallel::MulticoreParam())
+plotGeneCount(curves, clusters = DATA$seurat_subclusters, models = sceGAM)
+
+#Associated Gene with pseudotime and find lineage specific marker
+lc <- sapply(lineages@lineages, function(x) {
+    rev(x)[1]
+})
+names(lc) <- gsub("Lineage", "", names(lc))
+
+mypar()
+plot(DATA@reductions$umap@cell.embeddings, col = pal[DATA$seurat_subclusters], pch = 16)
+lines(curves, lwd = 2, col = "black")
+points(centroids2d[lc, ], col = "black", pch = 16, cex = 3)
+text(centroids2d[lc, ], labels = names(lc), cex = 1, font = 2, col = "white")
+
+#Save the psudotime association Genelist
+res <- na.omit(associationTest(sceGAM, contrastType = "consecutive"))
+res <- res[res$pvalue < 0.005, ]
+res <- res[res$waldStat > mean(res$waldStat), ]
+res <- res[order(res$waldStat, decreasing = T), ]
+res$gene <- rownames(res)
+write_csv(res, "results/cell/Myeloid/Trajectory/Psudo_Gene.csv")
+
+#Save the gene list between two psudotime point
+res <- na.omit(startVsEndTest(sceGAM, pseudotimeValues = c(6, 18.9)))
+res <- res[res$pvalue < 0.005, ]
+res <- res[res$waldStat > mean(res$waldStat), ]
+res <- res[order(res$waldStat, decreasing = T), ]
+res$gene <- rownames(res)
+write_csv(res, "results/cell/Myeloid/Trajectory/Psudo_Gene6_18.9.csv")
+
+#Genes that are different between lineages
+res <- na.omit(diffEndTest(sceGAM))
+res <- res[res$pvalue < 0.001, ]
+res <- res[res$waldStat > mean(res$waldStat), ]
+res <- res[order(res$waldStat, decreasing = T), ]
+res$gene <- rownames(res)
+write_csv(res, "results/cell/Myeloid/Trajectory/Lineage_Gene.csv")
+
+#Plot MHC-II genes along pseudotime
+plot_list = list()
+for (sigGeneStart in intersect(c("H2-Aa",   "H2-Ab1",  "H2-DMa",  "H2-DMb1","H2-Eb1"  ,"Cd74", "Cd274"), sel_genes)){
+print(sigGeneStart)
+plot_list[[sigGeneStart]]<- plotSmoothers(sceGAM, counts=drop0(DATA@assays$RNA@counts[sel_genes, sel_cells]), gene = sigGeneStart) + ggtitle(sigGeneStart)
+}
+plot_grid(ncol = 2, plotlist = plot_list)
+
+VlnPlot(DATA,features = c("H2-Aa", "H2-Ab1",  "H2-DMa", "H2-DMb1", "H2-DMb2","H2-Eb1", "H2-M3", "H2-Ob", "H2-Q10",  "H2-T23","Cd74"))
+```
+
+```{r}
+DimPlot(DATA_Myeloid, cols = c("grey","grey" ,"grey","grey","#00BFC4", "grey","grey", "grey","grey"))
+```

@@ -1,0 +1,275 @@
+---
+title: "scRNA-seq PBS vs AEC: SCENIC"
+author: "Yuxi"
+date: "2022-11-24"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+Single cell RNA-seq of one PBS-treated and one AEC-treated mouse. Ambient RNA was removed with CellBender.
+This script was written for Seurat v4. To run it with Seurat v5, keep `options(Seurat.object.assay.version = "v3")` in the setup chunk.
+
+Loom file for pySCENIC and downstream analysis of the regulons by immune cell type.
+Starts from the objects in `data/cell/` saved by `01_QC_integration_annotation.Rmd`. pySCENIC output: `results/cell/SCENIC/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load all the packages}
+library(tidyverse)
+library(Matrix)
+library(Seurat)
+options(Seurat.object.assay.version = "v3")
+
+library(cowplot)
+library(clustree)
+library(niceRplots)
+library(scCustomize)
+library(harmony)
+library(geomtextpath)
+library(webr)
+library(ComplexHeatmap)
+library(RColorBrewer)
+
+#For preprocessing
+library(DoubletFinder)
+
+#For Cell interaction
+library(CellChat)
+library(liana)
+
+#For enrichment Analysis
+library(correlationAnalyzeR)
+library(clusterProfiler)
+library(xlsx)
+library(gprofiler2)
+library(plotly)
+library(DOSE)
+
+#For transcriptional factor network
+library(loomR)
+
+#For Trajectory imputation
+library(slingshot)
+library(tradeSeq)
+library(fields)
+library(rafalib)
+
+for (d in c("data/cell", "results/cell/Myeloid", "results/cell/Myeloid/Trajectory", "results/cell/Mast", "results/cell/Tcell", "results/cell/Bcell", "results/cell/DC", "results/cell/Neutrophil", "results/cell/Cellchat", "results/cell/LIANA", "results/cell/SCENIC")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+
+```{r data preparation of SCENIC}
+## Read data
+raw_data <-  readRDS("data/cell/Cell_Immune.rds")
+raw_data<-SetIdent(raw_data,value = "Celltypes")
+dim(raw_data)
+
+raw_data <-DietSeurat(raw_data)
+write.csv(raw_data@meta.data[,"Celltypes", drop=FALSE], file="results/cell/SCENIC/cellAnnot_Celltypes.csv", quote=FALSE)
+
+## Create a loom file with the filtered data, to be used in pySCENIC:
+data_counts<-raw_data@assays$RNA@counts
+row_attrs<-list()
+row_attrs[["Gene"]]<-data_counts@Dimnames[[1]]
+
+col_attrs<-list()
+col_attrs[["CellID"]]<-data_counts@Dimnames[[2]]
+col_attrs[["nGene"]]<-Matrix::colSums(data_counts>0)
+col_attrs[["nUMI"]]<-Matrix::colSums(data_counts)
+
+create("results/cell/SCENIC/Immune_SCENIC.loom", data_counts, gene.attrs = row_attrs, cell.attrs = col_attrs)
+```
+
+pySCENIC was run on `Immune_SCENIC.loom`. The output files are read below.
+```{r SCENIC results}
+data <-  readRDS("data/cell/Cell_Immune.rds")
+
+scenic_regulon_umap<-read.table("results/cell/SCENIC/scenic_umap.txt", row.names = 1)
+scenic_auc_mtx<-read.table("results/cell/SCENIC/scenic_auc_mtx.txt", header=TRUE, row.names = 1, check.names = FALSE)
+scenic_RSS_Celltypes<-read.table("results/cell/SCENIC/scenic_RegulonSpecificityScores_Celltypes.txt",sep = '\t', header=TRUE, row.names = 1, check.names = FALSE)
+
+## Make up Seurat object
+colnames(scenic_regulon_umap)<-c("UMAP_1", "UMAP_2")
+reduction_regulon_umap <- CreateDimReducObject(
+  embeddings = as.matrix(scenic_regulon_umap),
+  stdev = as.numeric(apply(scenic_regulon_umap, 2, sd)),
+  key = "umap",
+  assay = "RNA"
+)
+data@reductions[["umap_regulon"]]<-reduction_regulon_umap
+
+p_gene<-DimPlot(data, reduction = "umap", group.by="Celltypes", shuffle = TRUE, label = T)+ ggtitle("Celltypes_UMAP")
+p_regulon<-DimPlot(data, reduction = "umap_regulon", group.by="Celltypes", shuffle = TRUE)+ggtitle("regulon_UMAP")
+ggsave("results/cell/SCENIC/DimPlot_UMAP_Celltypes.pdf", plot_grid(ncol = 2, p_gene, p_regulon), width=12, height=5)
+
+
+##
+RSS_matrix<-t(scenic_RSS_Celltypes)
+AUC_matrix<-t(scenic_auc_mtx)
+
+regulons<-rownames(RSS_matrix)
+identical(regulons, rownames(AUC_matrix))
+# TRUE
+
+topreg<-list()
+for (i in seq(ncol(RSS_matrix))) {
+  topreg[[i]]<-head(regulons[order(RSS_matrix[,i], decreasing = TRUE)], 30)
+}
+names(topreg)<-colnames(RSS_matrix)
+
+
+data@assays[["AUC"]]<-CreateAssayObject(data=AUC_matrix)
+data@assays[["AUC"]]@key<-"auc_"
+data@reductions[["umap_regulon"]]@assay.used<-"AUC"
+
+## Plot AUC on UMAP
+for (i in names(topreg)) {
+  for (feature in topreg[[i]]) {
+    gene<-sub("\\([+-]\\)$", "", feature, perl=TRUE)
+    data@active.assay<-"RNA"
+    p_gene<-FeaturePlot(data, features =gene, reduction = "umap", order=TRUE)
+    data@active.assay<-"AUC"
+    p_regulon<-FeaturePlot(data, features=feature, reduction = "umap", order=TRUE)
+    ggsave(paste0("results/cell/SCENIC/AUC_featurePlot_", i, "_", gene, ".pdf"), plot_grid(ncol = 2, p_gene, p_regulon), width=8, height=4)
+  }
+}
+
+topreg_df<-data.frame(Regulon="", Gene="", Celltypes="")
+for (i in colnames(RSS_matrix)) {
+  features<-regulons[order(RSS_matrix[,i], decreasing = TRUE)]
+  for (feature in features) {
+    gene<-sub("\\([+-]\\)$", "", feature, perl=TRUE)
+    topreg_df<-rbind(topreg_df, c(feature, gene, i))
+  }
+}
+topreg_df<-topreg_df[-1,]
+write.csv(topreg_df, "results/cell/SCENIC/AUC_regulon_list_all.csv", quote=FALSE, row.names=FALSE)
+
+
+## Dot plot
+scenic_auc_mtx_binary<-read.table("results/cell/SCENIC/scenic_auc_mtx_binary.txt", skip=1, row.names = 1, check.names = FALSE)
+scenic_auc_thresholds<-read.table("results/cell/SCENIC/scenic_auc_mtx_binary_thresholds.txt", skip=1, row.names = 1, check.names = FALSE)
+
+AUC_binary<-t(scenic_auc_mtx_binary)
+
+identical(regulons, sub("_(", "(", rownames(scenic_auc_thresholds), fixed=TRUE))
+# TRUE
+rownames(AUC_binary)<-regulons
+rownames(scenic_auc_thresholds)<-regulons
+
+data@assays[["AUC_binary"]]<-CreateAssayObject(data=AUC_binary)
+data@assays[["AUC_binary"]]@key<-"aucB_"
+
+saveRDS(data, "results/cell/SCENIC/SCENIC.rds")
+
+## Top 10
+RSS_matrix<-RSS_matrix[,sort(colnames(RSS_matrix))]
+top10_reg_df<-data.frame(Regulon="", Gene="", Celltypes="")
+for (i in colnames(RSS_matrix)) {
+  features<-head(regulons[order(RSS_matrix[,i], decreasing = TRUE)], 10)
+  for (feature in features) {
+    gene<-sub("\\([+-]\\)$", "", feature, perl=TRUE)
+    top10_reg_df<-rbind(top10_reg_df, c(feature, gene, i))
+  }
+}
+top10_reg_df<-top10_reg_df[-1,]
+write.csv(top10_reg_df, "results/cell/SCENIC/AUC_regulon_list_top10.csv", quote=FALSE, row.names=FALSE)
+
+# genes is either a number (top regulons per cell type) or a vector of gene names
+SCENICDot = function(data, RSS_matrix, genes){
+RSS_matrix<-RSS_matrix[,sort(colnames(RSS_matrix))]
+top_reg_df<-data.frame(Regulon="", Gene="", Celltypes="")
+for (i in colnames(RSS_matrix)) {
+  features<-regulons[order(RSS_matrix[,i], decreasing = TRUE)]
+  if (is.numeric(genes)) features <- head(features, genes)
+  for (feature in features) {
+    gene<-sub("\\([+-]\\)$", "", feature, perl=TRUE)
+    top_reg_df<-rbind(top_reg_df, c(feature, gene, i))
+  }
+}
+top_reg_df<-top_reg_df[-1,]
+if (!is.numeric(genes)) top_reg_df<- top_reg_df[top_reg_df$Gene %in% genes,]
+top_reg_df_plot<-top_reg_df[!duplicated(top_reg_df$Gene),1:2]
+
+data@active.assay<-"AUC"
+data_AUC_raw <- FetchData(object = data, vars = top_reg_df_plot$Regulon)
+data_AUC_raw$Celltypes <- factor(x = data[["Celltypes", drop = TRUE]])
+
+data@active.assay<-"AUC_binary"
+data_AUC_binary <- FetchData(object = data, vars = top_reg_df_plot$Regulon)
+data_AUC_binary$Celltypes <- factor(x = data[["Celltypes", drop = TRUE]])
+
+# Average activity per subtype----
+data_AUC_raw_Celltypes <- lapply(X = levels(x = data_AUC_raw$Celltypes), FUN = function(ident) {
+  data.use <- data_AUC_raw[data_AUC_raw$Celltypes == ident,
+                           1:(ncol(x = data_AUC_raw) - 1), drop = FALSE]
+  avg.exp <- apply(X = data.use, MARGIN = 2, FUN = function(x) {
+    return(mean(x = x))
+  })
+  pct.exp <- apply(X = data.use, MARGIN = 2, FUN = PercentAbove,
+                   threshold = 0)
+  return(list(avg.exp = avg.exp, pct.exp = pct.exp))
+})
+names(x = data_AUC_raw_Celltypes) <- levels(x = data_AUC_raw$Celltypes)
+
+data_AUC_raw_Celltypes <- lapply(X = names(x = data_AUC_raw_Celltypes), FUN = function(x) {
+  data.use <- as.data.frame(x = data_AUC_raw_Celltypes[[x]])
+  data.use$features.plot <- rownames(x = data.use)
+  data.use$Celltypes <- x
+  return(data.use)
+})
+data_AUC_raw_Celltypes <- do.call(what = "rbind", args = data_AUC_raw_Celltypes)
+
+data_AUC_raw_Celltypes_scaled <- sapply(X = unique(x = data_AUC_raw_Celltypes$features.plot),
+                                             FUN = function(x) {
+                                               data.use <- data_AUC_raw_Celltypes[data_AUC_raw_Celltypes$features.plot == x, "avg.exp"]
+                                               data.use <- scale(x = data.use)
+                                               data.use <- MinMax(data = data.use, min = -2.5, max = 2.5)
+                                               return(data.use)
+                                             })
+data_AUC_raw_Celltypes$avg.exp.scaled <- as.vector(x = t(x = data_AUC_raw_Celltypes_scaled))
+
+# Percent activated per subtype----
+data_AUC_raw_Celltypes_binary <- lapply(X = levels(x = data_AUC_binary$Celltypes), FUN = function(ident) {
+  data.use <- data_AUC_binary[data_AUC_binary$Celltypes == ident,
+                              1:(ncol(x = data_AUC_binary) - 1), drop = FALSE]
+  pct.act <- apply(X = data.use, MARGIN = 2, FUN = function(x) {
+    return(length(x = x[x == 1])/length(x = x))
+  })
+  return(list(pct.act = pct.act))
+})
+names(x = data_AUC_raw_Celltypes_binary) <- levels(x = data_AUC_binary$Celltypes)
+
+data_AUC_raw_Celltypes_binary <- lapply(X = names(x = data_AUC_raw_Celltypes_binary), FUN = function(x) {
+  data.use <- as.data.frame(x = data_AUC_raw_Celltypes_binary[[x]])
+  data.use$features.plot <- rownames(x = data.use)
+  data.use$Celltypes <- x
+  return(data.use)
+})
+data_AUC_raw_Celltypes_binary <- do.call(what = "rbind", args = data_AUC_raw_Celltypes_binary)
+
+data_AUC_raw_Celltypes$pct.act<-data_AUC_raw_Celltypes_binary$pct.act
+data_AUC_raw_Celltypes$features.plot <- factor(x = data_AUC_raw_Celltypes$features.plot, levels = rev(top_reg_df_plot$Regulon))
+data_AUC_raw_Celltypes$pct.exp <- data_AUC_raw_Celltypes$pct.exp * 100
+data_AUC_raw_Celltypes$pct.act <- data_AUC_raw_Celltypes$pct.act * 100
+
+ggplot(data = data_AUC_raw_Celltypes, mapping = aes_string(x = "Celltypes", y = "features.plot")) + geom_point(mapping = aes_string(size = "pct.act", color = "avg.exp.scaled")) +
+  scale_radius(range = c(0, 6), limits = c(NA, NA)) +
+  guides(size = guide_legend(title = "Percent Activated")) +
+  labs(title = "Regulons", x="", y="") + theme_cowplot() +
+  theme(axis.text.x = element_text(angle=90, vjust = 0.5, hjust=1)) +
+  scale_color_gradient2(low = "blue",mid = "grey", high = "red", midpoint = 0) +
+  guides(color = guide_colorbar(title = "Average Activity"))
+}
+
+SCENICDot(data, RSS_matrix, genes=50)
+
+genes = c("Jdp2", "Gbx1", "Elf4", "Chd2", "Zfp78", "Tfeb", "Sp4", "Foxp1", "Nfe2l2", "Sp3", "Hivep1", "Etv5", "Zfp704", "Ube2k", "Sfpq", "Chd1", "Mbd2", "Mlxipl", "Ikzf2", "Gabpa", "Nrf1", "Smad1", "Ehf", "Nfkb1", "Mafk", "Mtf1", "Zbtb5", "Irf2", "Rel", "Thrb", "Bach1", "Jund", "Cebpg", "Elf1", "Pbx1", "Ikzf3", "Creb1", "Pou1f1", "Etv4", "Setdb1", "Fosb", "Relb", "Hltf", "Atf3", "Epas1", "Klf6", "Zfp516", "Stat2", "Tfdp2", "Sall2", "Bclaf1", "Zfp189", "Bptf", "Gata2", "Heyl", "Foxo1", "Zbtb14", "Elk1", "Gata3", "Jun", "Etv6", "Clock", "Arntl2", "Eomes", "Hinfp", "Sp1", "Etv1", "Klf7", "Egr1", "Rxrb", "Max", "Hdx", "Elk4", "Zfp456")
+SCENICDot(data, RSS_matrix, genes=genes)
+```

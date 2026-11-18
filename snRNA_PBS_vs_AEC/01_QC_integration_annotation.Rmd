@@ -1,0 +1,497 @@
+---
+title: "snRNA-seq PBS vs AEC: QC, integration and annotation"
+author: "Yuxi"
+date: "2022-11-24"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+Single nuclei RNA-seq of one PBS-treated and one AEC-treated mouse. Ambient RNA was removed with CellBender.
+This script was written for Seurat v4. To run it with Seurat v5, keep `options(Seurat.object.assay.version = "v3")` in the setup chunk.
+
+Input: `data/nuclei/sn1_cellbender_filtered.h5` (PBS) and `data/nuclei/sn2_cellbender_filtered.h5` (AEC).
+Gene panels for the heatmaps: `data/gene_panels/`.
+Seurat objects are saved in `data/nuclei/`, tables in `results/nuclei/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load all the packages}
+library(tidyverse)
+library(Matrix)
+library(Seurat)
+options(Seurat.object.assay.version = "v3")
+library(DoubletFinder)
+library(cowplot)
+library(clustree)
+library(niceRplots)
+library(scCustomize)
+library(harmony)
+library(gprofiler2)
+library(geomtextpath)
+library(webr)
+library(plotly)
+library(sparseMatrixStats)
+library(rafalib)
+library(slingshot)
+
+dir.create("results/nuclei/Ols", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/nuclei/Neuron", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/nuclei/ASCs", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/nuclei/FBs", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r preprocess the PBS data}
+#Create a Seurat Object
+PBS <- Read_CellBender_h5_Mat(file_name = "data/nuclei/sn1_cellbender_filtered.h5")
+
+PBS <- CreateSeuratObject(counts = PBS, names.field = 1, names.delim = "_")
+#Start with PBS group----
+DATA = PBS
+
+#Calculate QC
+total_counts_per_cell <- colSums(DATA@assays$RNA@counts)
+mito_genes <- rownames(DATA)[grep("^mt-", rownames(DATA))]
+DATA$percent_mito <- colSums(DATA@assays$RNA@counts[mito_genes, ])/total_counts_per_cell
+
+ribo_genes <- rownames(DATA)[grep("^Rp[sl]", rownames(DATA))]
+DATA$percent_ribo <- colSums(DATA@assays$RNA@counts[ribo_genes, ])/total_counts_per_cell
+
+hb_genes <- rownames(DATA)[grep("^Hb[^(p)]", rownames(DATA))]
+DATA$percent_hb <- colSums(DATA@assays$RNA@counts[hb_genes, ])/total_counts_per_cell
+
+plat_genes <- rownames(DATA)[grep("Pecam1|Pf4", rownames(DATA))]
+DATA$percent_plat <- colSums(DATA@assays$RNA@counts[plat_genes, ])/total_counts_per_cell
+
+#Plot QC----
+VlnPlot(DATA, features = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb", "percent_plat"), pt.size = 0.1,ncol = 3) + NoLegend()
+
+hist(DATA$nFeature_RNA)
+range(DATA$nFeature_RNA)
+median(DATA$nFeature_RNA)
+sd(DATA$nFeature_RNA)
+
+#Filter the low qulity cells----
+selected_c <- WhichCells(DATA, expression = nFeature_RNA > 100)
+selected_f <- rownames(DATA)[ Matrix::rowSums(DATA) > 3]
+
+DATA <- subset(DATA, features=selected_f, cells=selected_c)
+dim(DATA)
+
+
+#Visualize which genes contribute to reads most ----
+par(mar = c(4, 8, 2, 1))
+C <- DATA@assays$RNA@counts
+C <- Matrix::t(Matrix::t(C)/Matrix::colSums(C)) * 100
+most_expressed <- order(apply(C, 1, median), decreasing = T)[20:1]
+boxplot(as.matrix(t(C[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = (scales::hue_pal())(20)[20:1], horizontal = TRUE)
+
+#Filter data with mitochondrial genes and ribosomal genes ratio
+selected_mito <- WhichCells(DATA, expression = percent_mito < 0.2)
+selected_ribo <- WhichCells(DATA, expression = percent_ribo < 0.03)
+
+# and subset the object to only keep those cells
+DATA <- subset(DATA, cells = selected_mito)
+DATA <- subset(DATA, cells = selected_ribo)
+
+dim(DATA)
+
+# Computing the cellcycle----
+# Before running CellCycleScoring the data need to be normalized and
+# logtransformed.
+DATA = NormalizeData(DATA)
+
+DATA <- CellCycleScoring(object = DATA, g2m.features = gorth(cc.genes.updated.2019$g2m.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name,
+    s.features= gorth(cc.genes.updated.2019$s.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name)
+VlnPlot(DATA, features = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb", "percent_plat","S.Score", "G2M.Score"), pt.size = 0.1, ncol =4) + NoLegend()
+
+
+#Calculate the doublet----
+DATA = FindVariableFeatures(DATA)
+DATA = ScaleData(DATA, vars.to.regress = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb","S.Score", "G2M.Score", "percent_plat"))
+DATA = RunPCA(DATA, npcs = 30)
+DATA = RunUMAP(DATA, dims = 1:30)
+FeaturePlot(DATA, c("Gfap", "Mbp","Rps7", "Mt2", "Aqp4", "Clec7a", "Olig2"))
+
+# define the expected number of doublet cells.
+nExp <- round(ncol(DATA) * 0.04)  # expect 4% doublets (Check 10X loaded chart)
+set.seed(1)
+DATA <- doubletFinder_v3(DATA, pN = 0.25, pK = 0.09, nExp = nExp, PCs = 1:30)
+# name of the DF prediction can change, so extract the correct column name.
+DF.name = colnames(DATA@meta.data)[grepl("DF.classification", colnames(DATA@meta.data))]
+DATA$DF <- DATA@meta.data[, DF.name]
+plot_grid(ncol = 2, DimPlot(DATA, group.by = "orig.ident") + NoAxes(),
+    DimPlot(DATA, group.by = "DF") + NoAxes())
+VlnPlot(DATA, features = "nFeature_RNA", group.by = "DF", pt.size = 0.1)
+
+#Remove the doublet----
+DATA <- DATA[, DATA$DF == "Singlet"]
+
+#Set a filter to remove the abnormally high expression cells
+high.det <- WhichCells(DATA, expression = nFeature_RNA > 6500)
+# remove these cells
+DATA <- subset(DATA, cells=setdiff(WhichCells(DATA),c(high.det)))
+
+DATA$Condition <- "PBS"
+saveRDS(DATA,"data/nuclei/PBS_QCed.rds")
+```
+
+```{r preprocess the AECs data}
+
+#create a seurat object
+AECs <- Read_CellBender_h5_Mat(file_name = "data/nuclei/sn2_cellbender_filtered.h5")
+AECs <- CreateSeuratObject(counts = AECs, names.field = 1,names.delim =  "_")
+#Start with AECs group----
+DATA = AECs
+
+#Calculate QC
+total_counts_per_cell <- colSums(DATA@assays$RNA@counts)
+mito_genes <- rownames(DATA)[grep("^mt-", rownames(DATA))]
+DATA$percent_mito <- colSums(DATA@assays$RNA@counts[mito_genes, ])/total_counts_per_cell
+
+ribo_genes <- rownames(DATA)[grep("^Rp[sl]", rownames(DATA))]
+DATA$percent_ribo <- colSums(DATA@assays$RNA@counts[ribo_genes, ])/total_counts_per_cell
+
+hb_genes <- rownames(DATA)[grep("^Hb[^(p)]", rownames(DATA))]
+DATA$percent_hb <- colSums(DATA@assays$RNA@counts[hb_genes, ])/total_counts_per_cell
+
+plat_genes <- rownames(DATA)[grep("Pecam1|Pf4", rownames(DATA))]
+DATA$percent_plat <- colSums(DATA@assays$RNA@counts[plat_genes, ])/total_counts_per_cell
+
+#Plot QC----
+VlnPlot(DATA, features = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb", "percent_plat"), pt.size = 0.1,ncol = 3) + NoLegend()
+
+hist(DATA$nFeature_RNA)
+range(DATA$nFeature_RNA)
+median(DATA$nFeature_RNA)
+sd(DATA$nFeature_RNA)
+
+#Filter the low qulity cells----
+selected_c <- WhichCells(DATA, expression = nFeature_RNA > 100)
+selected_f <- rownames(DATA)[ Matrix::rowSums(DATA) > 3]
+
+DATA <- subset(DATA, features=selected_f, cells=selected_c)
+dim(DATA)
+
+
+#Visualize which genes contribute to reads most ----
+par(mar = c(4, 8, 2, 1))
+C <- DATA@assays$RNA@counts
+C <- Matrix::t(Matrix::t(C)/Matrix::colSums(C)) * 100
+most_expressed <- order(apply(C, 1, median), decreasing = T)[20:1]
+boxplot(as.matrix(t(C[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = (scales::hue_pal())(20)[20:1], horizontal = TRUE)
+
+#Filter data with mitochondrial genes and ribosomal genes ratio
+selected_mito <- WhichCells(DATA, expression = percent_mito < 0.2)
+selected_ribo <- WhichCells(DATA, expression = percent_ribo < 0.03)
+
+# and subset the object to only keep those cells
+DATA <- subset(DATA, cells = selected_mito)
+DATA <- subset(DATA, cells = selected_ribo)
+
+dim(DATA)
+
+# Computing the cellcycle----
+# Before running CellCycleScoring the data need to be normalized and
+# logtransformed.
+DATA = NormalizeData(DATA)
+
+DATA <- CellCycleScoring(object = DATA, g2m.features = gorth(cc.genes.updated.2019$g2m.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name,
+    s.features= gorth(cc.genes.updated.2019$s.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name)
+VlnPlot(DATA, features = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb", "percent_plat","S.Score", "G2M.Score"), pt.size = 0.1, ncol =4) + NoLegend()
+
+
+#Calculate the doublet----
+DATA = FindVariableFeatures(DATA)
+DATA = ScaleData(DATA, vars.to.regress = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb","S.Score", "G2M.Score", "percent_plat"))
+DATA = RunPCA(DATA, npcs = 30)
+DATA = RunUMAP(DATA, dims = 1:30)
+
+# define the expected number of doublet cells.
+nExp <- round(ncol(DATA) * 0.04)  # expect 4% doublets (Check 10X loaded chart)
+set.seed(1)
+DATA <- doubletFinder_v3(DATA, pN = 0.25, pK = 0.09, nExp = nExp, PCs = 1:30)
+# name of the DF prediction can change, so extract the correct column name.
+DF.name = colnames(DATA@meta.data)[grepl("DF.classification", colnames(DATA@meta.data))]
+DATA$DF <- DATA@meta.data[, DF.name]
+plot_grid(ncol = 2, DimPlot(DATA, group.by = "orig.ident") + NoAxes(),
+    DimPlot(DATA, group.by = "DF") + NoAxes())
+VlnPlot(DATA, features = "nFeature_RNA", group.by = "DF", pt.size = 0.1)
+
+#Remove the doublet----
+DATA <- DATA[, DATA$DF == "Singlet"]
+
+#Set a filter to remove the abnormally high expression cells
+high.det <- WhichCells(DATA, expression = nFeature_RNA > 6500)
+# remove these cells
+DATA <- subset(DATA, cells=setdiff(WhichCells(DATA),c(high.det)))
+
+DATA$Condition <- "AEC"
+saveRDS(DATA,"data/nuclei/AEC_QCed.rds")
+```
+
+```{r merge the data and dimensional reduction}
+
+PBS <- readRDS("data/nuclei/PBS_QCed.rds")
+AEC <- readRDS("data/nuclei/AEC_QCed.rds")
+
+DATA <- merge(PBS, AEC)
+DATA <- FindVariableFeatures(DATA, selection.method = "vst",nfeatures = 2000,  assay = "RNA")
+
+top20 <- head(VariableFeatures(DATA), 20)
+LabelPoints(plot = VariableFeaturePlot(DATA), points = top20, repel = TRUE)
+
+
+DATA = ScaleData(DATA, vars.to.regress = c("nFeature_RNA","nCount_RNA","percent_mito", "percent_ribo", "percent_hb","S.Score", "G2M.Score", "percent_plat"))
+DATA = RunPCA(DATA, npcs = 30)
+DATA = RunUMAP(DATA, dims = 1:30)
+
+plot_grid( DimPlot(DATA, reduction = "pca", group.by = "orig.ident"),DimPlot(DATA,reduction = "umap", group.by = "Condition"))
+```
+
+```{r integrate the dataset}
+alldata.list <- SplitObject(DATA, split.by = "Condition")
+
+for (i in 1:length(alldata.list)) {
+    alldata.list[[i]] <- NormalizeData(alldata.list[[i]])
+    alldata.list[[i]] <- FindVariableFeatures(alldata.list[[i]], selection.method = "vst",
+        nfeatures = 2000)
+}
+
+hvgs_per_dataset <- lapply(alldata.list, function(x) {
+    x@assays$RNA@var.features
+})
+venn::venn(hvgs_per_dataset,opacity = .4,zcolor = scales::hue_pal()(3),cexsn= 1,cexil = 1,lwd=1,col='white',frame=F,borders = NA)
+
+#Intigrate DATA with CCA ----
+alldata.anchors <- FindIntegrationAnchors(object.list = alldata.list, dims = 1:30,
+    reduction = "cca")
+
+alldata.int <- IntegrateData(anchorset = alldata.anchors, dims = 1:30, new.assay.name = "CCA")
+names(alldata.int@assays)
+
+
+alldata.int <- ScaleData(alldata.int, features = rownames(alldata.int))
+alldata.int <- RunPCA(alldata.int, npcs = 30)
+alldata.int <- RunUMAP(alldata.int, dims = 1:30, n.components = 3)
+alldata.int@reductions$umap3d <- alldata.int@reductions$umap
+alldata.int <- RunUMAP(alldata.int, dims = 1:30)
+alldata.int <- RunTSNE(alldata.int, dims = 1:30)
+
+
+# Integrate DATA with Harmony (for comparison)----
+alldata.harmony <- RunHarmony(DATA, group.by.vars = "Condition", reduction = "pca",
+    dims.use = 1:30, assay.use = "RNA")
+alldata.int[["harmony"]] <- alldata.harmony[["harmony"]]
+alldata.int <- RunUMAP(alldata.int, dims = 1:30, reduction = "harmony", reduction.name = "umap_harmony")
+
+# Plot the reduction----
+plot_grid(ncol = 3,
+  DimPlot(DATA, reduction = "pca", group.by = "Condition")+NoAxes()+ggtitle("PCA raw_data"),
+  DimPlot(DATA, reduction = "umap", group.by = "Condition")+NoAxes()+ggtitle("UMAP raw_data"),
+
+  DimPlot(alldata.int, reduction = "pca", group.by = "Condition")+NoAxes()+ggtitle("PCA integrated"),
+  DimPlot(alldata.int, reduction = "tsne", group.by = "Condition")+NoAxes()+ggtitle("tSNE integrated"),
+  DimPlot(alldata.int, reduction = "umap", group.by = "Condition")+NoAxes()+ggtitle("UMAP integrated"),
+  DimPlot(alldata.int, reduction = "umap3d", group.by = "Condition")+NoAxes()+ggtitle("UMAP_3D integrated")
+)
+plot_grid(DimPlot(alldata.int, reduction = "umap", group.by = "Condition")+NoAxes()+ggtitle("UMAP integrated"),
+  DimPlot(alldata.int, reduction = "umap_harmony", group.by = "Condition")+NoAxes()+ggtitle("Harmony integrated"))
+
+```
+Because when I did clustering with scale of all information, I found that there is a cluster full of ribosome genes, which is out of our scientific scope, and other interesting results could also be masked here. So I decieded to use the version with regression out ribosome percentage.
+```{r clustering the data}
+
+DATA <- FindNeighbors(alldata.int, dims = 1:30, k.param = 12.5)
+
+for (res in c(0.1, 0.25,0.3,0.35,0.4,0.45, 0.5,0.55,0.6,0.65,0.75, 1,1.25, 1.5,1.75, 2,2.25, 2.5,3)) {
+  print(paste0("current res", res))
+    DATA <- FindClusters(DATA, graph.name = "CCA_snn", resolution = res, algorithm = 1)
+}
+
+clustree(DATA@meta.data, prefix = "CCA_snn_res.")
+
+plot_grid(
+  DimPlot(DATA, reduction = "umap", group.by = "CCA_snn_res.0.6", label = T) + ggtitle("res_0.6"),
+  DimPlot(DATA, reduction = "umap", group.by = "CCA_snn_res.0.45", label = T) + ggtitle("CCA_res_0.45"),
+  DimPlot(DATA, reduction = "umap", group.by = "CCA_snn_res.0.65", label = T) + ggtitle("CCA_res_0.65"),
+  DimPlot(DATA, reduction = "umap", group.by = "CCA_snn_res.0.75", label = T) + ggtitle("CCA_res_0.75"))
+FeaturePlot(DATA, "percent_ribo")
+
+myfeatures <- c("Cd3e","Cd3d", "Cd4", "Cd8a", "Nkg7", "Ms4a1", "Cd14", "Ms4a7",
+     "Cst3", "Fcer1a", "Ptprc", "Cd68")
+plot_list <- list()
+for (i in myfeatures) {
+    plot_list[[i]] <- FeaturePlot(DATA,  reduction = "umap", dims = 1:2, features = i,
+        ncol = 3, order = T) + NoLegend() + NoAxes() + NoGrid()
+}
+plot_grid(ncol = 4, plotlist = plot_list)
+
+saveRDS(DATA, file = "data/nuclei/nuclei_CCA.rds")
+```
+
+```{r Generate DEGs}
+DATA = readRDS("data/nuclei/nuclei_CCA.rds")
+
+# Lets go for resolution 0.6
+DATA <- SetIdent(DATA, value = "CCA_snn_res.0.6")
+DATA$seurat_clusters <- DATA$CCA_snn_res.0.6
+plot_grid(
+DimPlot(DATA, label = T, group.by = "CCA_snn_res.0.6",split.by = "Condition") + NoAxes(),
+FeaturePlot(DATA, features = c("Clec7a", "Ptprc"), ncol = 2), ncol =1)
+
+DefaultAssay(DATA) <-  "RNA"
+detable_all <- FindAllMarkers(DATA, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+
+# create a scale.data slot for the selected genes
+Data <- ScaleData(DATA, features = as.character(unique(top5_all$gene)), assay = "RNA")
+DoHeatmap(Data, features = as.character(unique(top5_all$gene)), group.by = "CCA_snn_res.0.6",
+    assay = "RNA")
+
+DotPlot(DATA, features  = rev(as.character(unique(top5_all$gene))), group.by  = "seurat_clusters") + coord_flip()
+
+
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(top20_all, file = "results/nuclei/Major_Markers_All_top20.csv")
+write.csv(detable_all, file = "results/nuclei/Major_Markers_All.csv")
+write.csv(top5_all, file = "results/nuclei/Major_Markers_Top5.csv")
+
+```
+
+
+```{r Annotate the Dataset}
+DATA <- SetIdent(DATA, value = "CCA_snn_res.0.6")
+DimPlot(DATA, group.by = "CCA_snn_res.0.6", label = T)
+# cluster 26 is left unannotated and removed below
+new.ids <- c("Neuron",
+             "Neuron",
+             "Immune Cell",
+             "Meninges",
+             "Oligodendrocyte",
+             "Neuron",
+             "Neuron",
+             "Neuron",
+             "Neuron",
+             "Oligodendrocyte",
+             "Oligodendrocyte",
+             "Neuron",
+             "Neuron",
+             "Neuron",
+             "Astrocyte",
+             "OPCs",
+             "Meninges",
+             "OPCs",
+             "Neuron",
+             "Immune Cell",
+             "Meninges",
+             "Schwann Cell",
+             "Neuron",
+             "Oligodendrocyte",
+             "Neuron",
+             "Pericyte",
+             "Unknown")
+
+new.ids <- setNames(new.ids,as.character(0:(length(new.ids)-1) ))
+DATA$Celltypes <- new.ids [ match( as.character(DATA$CCA_snn_res.0.6) , names(new.ids))  ]
+
+DimPlot(DATA, group.by = "Celltypes", label = T)
+
+DATA <- SetIdent(DATA, value = "Celltypes")
+DATA <- subset(DATA, idents = c("Astrocyte",  "Immune Cell", "Meninges", "Neuron", "Oligodendrocyte", "OPCs", "Pericyte", "Schwann Cell"))
+t(table(DATA$Celltypes))
+
+saveRDS(DATA, "data/nuclei/Nuclei_DATA.rds")
+
+
+# Plot Marker fro each Celltypes
+myfeatures <- c("Aqp4",
+                "Ptprc",
+                "Itgbl1",
+                "Lrfn5",
+                "Mog",
+                "Sox10",
+                "Atp13a5",
+                "Pecam1",
+                "Mpz")
+plot_list <- list()
+for (i in myfeatures) {
+    plot_list[[i]] <- VlnPlot(DATA, features = i, group.by = "Celltypes",ncol =1, pt.size = 0.1) + theme(panel.background = element_rect(colour = "black", fill=NA, linewidth = 1)) + NoLegend() + NoAxes()
+}
+plot_grid(ncol = 1, plotlist = plot_list)
+
+plot_list <- list()
+for (i in myfeatures) {
+    plot_list[[i]] <- FeaturePlot(DATA,  reduction = "umap", dims = 1:2, features = i,
+         order = T) + NoAxes() + NoGrid() + NoLegend()
+}
+plot_grid(ncol = 3, plotlist = plot_list )
+
+```
+
+```{r Proportions}
+#Proportions of each celltype under each Condition----
+
+summarized.df <- DATA@meta.data %>%
+  group_by(Celltypes, Condition) %>%
+  summarize(nCells = n()) %>%
+  group_by(Celltypes) %>%
+  mutate(prop = nCells/sum(nCells))
+
+ggplot() +
+  geom_bar(data = summarized.df, aes(Celltypes, prop, fill = Condition), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip()
+
+#Proportion of each Condition under celltyeps ----
+summarized.df <- DATA@meta.data %>%
+  group_by(Condition, Celltypes) %>%
+  summarize(nCells = n()) %>%
+  group_by(Condition) %>%
+  mutate(prop = nCells/sum(nCells))
+
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = Celltypes), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip()
+AEC_Celltypes = summarized.df[summarized.df$Condition == "AEC",]
+PBS_Celltypes = summarized.df[summarized.df$Condition == "PBS",]
+
+AEC_Celltypes = AEC_Celltypes %>%  mutate(percentage = round(prop,3)*100)
+PBS_Celltypes = PBS_Celltypes %>%  mutate(percentage = round(prop,3)*100)
+
+ggplot(data = PBS_Celltypes,
+       aes(x = 2, y = percentage, fill = Celltypes))+
+  geom_bar(stat = "identity", color = "white")+
+  coord_polar("y", start = 200) +
+  geom_textpath(position = position_stack(vjust = 0.5), angle = 90, size =3.5, col="white", aes( label= paste0(percentage,"%", sep = "")))+
+  theme_void() +
+  xlim(.2,2.5) + ggtitle("PBS")
+
+ggplot(data = AEC_Celltypes,
+       aes(x = 2, y = percentage, fill = Celltypes))+
+  geom_bar(stat = "identity", color = "white")+
+  coord_polar("y", start = 200) +
+  geom_textpath(position = position_stack(vjust = 0.5), angle = 90, size =3.5, col="white", aes( label= paste0(percentage,"%", sep = "")))+
+  theme_void() +
+  xlim(.2,2.5) + ggtitle("AEC")
+
+
+PieDonut(summarized.df, aes(Condition,Celltypes, count = nCells),r0 = 0.3, ratioByGroup = T,showRatioThreshold = 0, labelpositionThreshold = 0.1)
+
+```

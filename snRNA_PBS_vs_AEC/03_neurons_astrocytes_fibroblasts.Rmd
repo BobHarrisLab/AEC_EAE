@@ -1,0 +1,291 @@
+---
+title: "snRNA-seq PBS vs AEC: neurons, astrocytes and fibroblasts"
+author: "Yuxi"
+date: "2022-11-24"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Single nuclei RNA-seq of one PBS-treated and one AEC-treated mouse. Ambient RNA was removed with CellBender.
+This script was written for Seurat v4. To run it with Seurat v5, keep `options(Seurat.object.assay.version = "v3")` in the setup chunk.
+
+Subclustering of neurons, astrocytes and meningeal fibroblasts.
+Starts from `data/nuclei/Nuclei_DATA.rds`, saved by `01_QC_integration_annotation.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load all the packages}
+library(tidyverse)
+library(Matrix)
+library(Seurat)
+options(Seurat.object.assay.version = "v3")
+library(DoubletFinder)
+library(cowplot)
+library(clustree)
+library(niceRplots)
+library(scCustomize)
+library(harmony)
+library(gprofiler2)
+library(geomtextpath)
+library(webr)
+library(plotly)
+library(sparseMatrixStats)
+library(rafalib)
+library(slingshot)
+
+dir.create("results/nuclei/Ols", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/nuclei/Neuron", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/nuclei/ASCs", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/nuclei/FBs", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r Neuron}
+#Subset the Neuron----
+DATA <- readRDS("data/nuclei/Nuclei_DATA.rds")
+DATA <- SetIdent(DATA, value = "Celltypes")
+DATA_Neuron <- subset( DATA, idents = "Neuron")
+DATA_Neuron <- DATA_Neuron[!grepl("^mt", rownames(DATA_Neuron)), ]
+DefaultAssay(DATA_Neuron) <- "CCA"
+
+DATA_Neuron <- ScaleData(DATA_Neuron, features = rownames(DATA_Neuron))
+DATA_Neuron <- RunPCA(DATA_Neuron, npcs = 30)
+DATA_Neuron <- RunUMAP(DATA_Neuron, dims = 1:30, n.components = 3)
+DATA_Neuron@reductions$umap3d <- DATA_Neuron@reductions$umap
+DATA_Neuron <- RunUMAP(DATA_Neuron, dims = 1:30)
+
+DimPlot(DATA_Neuron,group.by = "Condition")
+
+
+# Redo the clustering ----
+DATA_Neuron <- FindNeighbors(DATA_Neuron, dims = 1:30, k.param =11)
+
+for (res in c(0.1, 0.15,0.16,0.17,0.18,0.2,0.25,0.3,0.35,0.4,0.45, 0.5,0.55,0.6,0.65,0.75, 1,1.25, 1.5,1.75, 2,2.25, 2.5,3)) {
+  print(paste0("current res", res))
+    DATA_Neuron <- FindClusters(DATA_Neuron, graph.name = "CCA_snn", resolution = res, algorithm = 1)
+}
+
+clustree(DATA_Neuron@meta.data, prefix = "CCA_snn_res.")
+
+
+# Lets go for resolution 0.5
+DATA_Neuron <- SetIdent(DATA_Neuron, value = "CCA_snn_res.0.5")
+DATA_Neuron$seurat_clusters <- DATA_Neuron$CCA_snn_res.0.5
+DimPlot(DATA_Neuron, label = T, group.by = "CCA_snn_res.0.5", split.by = "Condition")
+
+
+#Generate DEGs----
+DefaultAssay(DATA_Neuron) <-  "RNA"
+detable_all <- FindAllMarkers(DATA_Neuron, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(top20_all, file = "results/nuclei/Neuron/Markers_top20.csv")
+write.csv(detable_all, file = "results/nuclei/Neuron/Markers_All.csv")
+write.csv(top5_all, file = "results/nuclei/Neuron/Markers_Top5.csv")
+
+plot_dots(DATA_Neuron, genes = top5_all$gene, clustering = "seurat_clusters")
+plot_dots(DATA_Neuron, genes = c( "Poln","Spp1", #MNa
+                                  "Esrrg", "Htr1f", #MNg
+                                  "Gfra3", "Nos1", "Fbn2", #pregonglionic cells
+                                  "Pkd2l1", "Pkd1l2", #CSF-cN
+                                  "Chat","Slc5a7", #Cho
+                                  "Cpne4", "Dach2","Prkcg", "Slc6a5", "Gad2", "Gad1","Pax2","Anxa4"
+                                  ),assay = "RNA",clustering = "seurat_clusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+plot_dots(DATA_Neuron, genes = c("Slc5a7","Chat","Slc17a8","Slc17a6","Gad1","Gad2","Slc6a5","Bcl6", "Nos1", "Pax2"),assay = "RNA",clustering = "seurat_clusters", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+#Annotate the Dataset----
+DATA_Neuron <- SetIdent(DATA_Neuron, value = "CCA_snn_res.0.5")
+new.ids <- c("ExN",
+             "ExN",
+             "ExN",
+             "InN",
+             "ExN",
+             "ExN",
+             "InN",
+             "ExN",
+             "InN",
+             "ExN",
+             "InN",
+             "ExN",
+             "ExN",
+             "InN",
+             "ExN",
+             "InN",
+             "InN",
+             "InN",
+             "ExN",
+             "AEC",
+             "MN",
+             "ChN")
+
+new.ids <- setNames(new.ids,as.character(0:(length(new.ids)-1) ))
+DATA_Neuron$Subtypes <- new.ids [ match( as.character(DATA_Neuron$CCA_snn_res.0.5) , names(new.ids))  ]
+
+DimPlot(DATA_Neuron,group.by = "Subtypes", label = F)
+DATA_Neuron <- SetIdent(DATA_Neuron, value = "Subtypes")
+DATA_Neuron <- subset( DATA_Neuron, idents = c("ChN", "ExN", "InN", "MN"))
+saveRDS(DATA_Neuron, "data/nuclei/Nuclei_DATA_Neuron.rds")
+
+
+#Proportion of each Condition under celltyeps ----
+summarized.df <- DATA_Neuron@meta.data %>%
+  group_by(Condition, Subtypes) %>%
+  summarize(nCells = n()) %>%
+  group_by(Condition) %>%
+  mutate(prop = nCells/sum(nCells))
+
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = Subtypes), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip()
+
+PieDonut(summarized.df, aes(Condition,Subtypes, count = nCells),r0 = 0.3, ratioByGroup = T,showRatioThreshold = 0, labelpositionThreshold = 0.1)
+
+```
+
+```{r ASCs}
+DATA <- readRDS("data/nuclei/Nuclei_DATA.rds")
+DATA_ASCs <- DATA %>% SetIdent(value = "Celltypes") %>% subset(idents = c("Astrocyte"))
+
+#Get rid of mitochondrial Genes
+DATA_ASCs <- DATA_ASCs[!grepl("^mt", rownames(DATA_ASCs)), ]
+DefaultAssay(DATA_ASCs) <- "CCA"
+DATA_ASCs <- ScaleData(DATA_ASCs, features = rownames(DATA_ASCs))
+DATA_ASCs <- RunPCA(DATA_ASCs, npcs = 30)
+DATA_ASCs <- RunUMAP(DATA_ASCs, dims = 1:30)
+
+DimPlot(DATA_ASCs, group.by = "Condition")
+# Redo the clustering ----
+DATA_ASCs <- FindNeighbors(DATA_ASCs, dims = 1:30, k.param =12)
+
+for (res in c(0.1, 0.15,0.16,0.17,0.18,0.2,0.25,0.3,0.35,0.4,0.45, 0.5,0.55,0.6,0.65,0.75, 1,1.25, 1.5,1.75, 2,2.25, 2.5,3)) {
+  print(paste0("current res", res))
+    DATA_ASCs <- FindClusters(DATA_ASCs, graph.name = "CCA_snn", resolution = res, algorithm = 1)
+}
+
+clustree(DATA_ASCs@meta.data, prefix = "CCA_snn_res.")
+
+DimPlot(DATA_ASCs, group.by = "CCA_snn_res.0.5",split.by = "Condition",label = F, pt.size = 3) + ggtitle("Astrocyte Subtypes")
+
+# Generate Condition Specific GeneList ----
+DefaultAssay(DATA_ASCs) <-  "RNA"
+DATA_ASCs <- SetIdent(DATA_ASCs, value = "CCA_snn_res.0.5")
+detable_all <- FindAllMarkers(DATA_ASCs, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(top20_all, file = "results/nuclei/ASCs/ASC_Markers_top20.csv")
+write.csv(detable_all, file = "results/nuclei/ASCs/ASC_Markers_All.csv")
+write.csv(top5_all, file = "results/nuclei/ASCs/ASC_Markers_Top5.csv")
+plot_dots(DATA_ASCs, genes = c( as.character(unique(top5_all$gene)), "Top2a", "Mki67"),main = "Astrocytes",assay = "RNA",clustering = "CCA_snn_res.0.5", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+plot_dots(DATA_ASCs, genes = c("Il6","Tnf","Vegfa","Il1b","Tlr3"),main = "Astrocytes",assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+# Proportions----
+summarized.df <- DATA_ASCs@meta.data %>%
+  group_by(Condition, CCA_snn_res.0.5) %>%
+  summarize(nCells = n()) %>%
+  group_by(Condition) %>%
+  mutate(prop = nCells/sum(nCells))
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = CCA_snn_res.0.5), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip()
+
+#Astrocytes in total cells
+Proportions <- DATA@meta.data %>%
+  group_by(Condition) %>%
+  summarize(Prop = mean(Celltypes == "Astrocyte") * 100)
+Proportions$Condition <- factor(Proportions$Condition ,levels = c("PBS","AEC"))
+
+ggplot() +
+  geom_bar(data = Proportions, aes(Condition, Prop, fill = Condition),stat = "identity") +
+  ylab("Astrocytes in Total Cells (in Percentage)") +theme_classic()
+
+```
+
+```{r FBs}
+DATA <- readRDS("data/nuclei/Nuclei_DATA.rds")
+DATA_FB <- DATA %>% SetIdent(value = "Celltypes") %>% subset(idents = c("Meninges"))
+
+#Get rid of mitochondrial Genes
+DATA_FB <- DATA_FB[!grepl("^mt", rownames(DATA_FB)), ]
+DefaultAssay(DATA_FB) <- "CCA"
+DATA_FB <- ScaleData(DATA_FB, features = rownames(DATA_FB))
+DATA_FB <- RunPCA(DATA_FB, npcs = 30)
+DATA_FB <- RunUMAP(DATA_FB, dims = 1:30)
+
+DimPlot(DATA_FB, group.by = "Condition")
+# Redo the clustering ----
+DATA_FB <- FindNeighbors(DATA_FB, dims = 1:30, k.param =12)
+
+for (res in c(0.1, 0.15,0.16,0.17,0.18,0.2,0.25,0.3,0.35,0.4,0.45, 0.5,0.55,0.6,0.65,0.75, 1,1.25, 1.5,1.75, 2,2.25, 2.5,3)) {
+  print(paste0("current res", res))
+    DATA_FB <- FindClusters(DATA_FB, graph.name = "CCA_snn", resolution = res, algorithm = 1)
+}
+
+clustree(DATA_FB@meta.data, prefix = "CCA_snn_res.")
+
+DimPlot(DATA_FB, group.by = "CCA_snn_res.0.4",label = T, pt.size = 3) + ggtitle("Fibroblast Subtypes")
+
+# Generate Condition Specific GeneList ----
+DefaultAssay(DATA_FB) <-  "RNA"
+DATA_FB <- SetIdent(DATA_FB, value = "CCA_snn_res.0.4")
+detable_all <- FindAllMarkers(DATA_FB, log2FC.threshold = 0.2,
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-10, p_val) %>% top_n(5, log.pct.diff) -> top5_all
+detable_all %>% group_by(cluster)  %>% top_n(-50, p_val) %>% top_n(20, log.pct.diff) -> top20_all
+write.csv(top20_all, file = "results/nuclei/FBs/FB_Markers_top20.csv")
+write.csv(detable_all, file = "results/nuclei/FBs/FB_Markers_All.csv")
+write.csv(top5_all, file = "results/nuclei/FBs/FB_Markers_Top5.csv")
+plot_dots(DATA_FB, genes = c( as.character(unique(top5_all$gene))),main = "Fibroblast Subtypes",assay = "RNA",clustering = "CCA_snn_res.0.4", pal = c("#cfc8d7","#a577f2", "#0434ff"),show_grid = F)
+plot_dots(DATA_FB, genes = c("Il6","Tnf","Vegfa","Il1b","Tlr3"),main = "Fibroblasts",assay = "RNA",clustering = "Condition", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+plot_dots(DATA_FB, genes = c("Cd4","Cd8a","Cd3e","Foxp3","Cd27","Cd79a","Ptprc","Col1a1","Col3a1","Pdgfra"),assay = "RNA",clustering = "CCA_snn_res.0.4", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+# Proportions----
+summarized.df <- DATA_FB@meta.data %>%
+  group_by(Condition, CCA_snn_res.0.4) %>%
+  summarize(nCells = n()) %>%
+  group_by(Condition) %>%
+  mutate(prop = nCells/sum(nCells))
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = CCA_snn_res.0.4), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip()
+
+#Fibroblasts in total cells
+Proportions <- DATA@meta.data %>%
+  group_by(Condition) %>%
+  summarize(Prop = mean(Celltypes == "Meninges") * 100)
+Proportions$Condition <- factor(Proportions$Condition ,levels = c("PBS","AEC"))
+
+ggplot() +
+  geom_bar(data = Proportions, aes(Condition, Prop, fill = Condition),stat = "identity") +
+  ylab("Fibroblast in Total Cells (in Percentage)") +theme_classic()
+
+```

@@ -1,0 +1,443 @@
+---
+title: "Brain CD45 and HG cells: trajectory"
+output: html_document
+---
+
+Brain CD45+ immune cells and high granularity (HG) cells from PBS- and AEC-treated mice (GEO: GSE301590).
+
+Slingshot and tradeSeq on monocytes, macrophages and HG_3 cells, and Monocle 3 on the same cell types.
+Starts from `data/scrna/Cd45_HG.rds`, saved by `02_merge_CD45_HG.Rmd`. fitGAM was run on UPPMAX; the fitted models are read from `data/scrna/GAM2.rds` and `data/scrna/GAM_condition.rds`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load the packages
+```{r Load the Packages}
+library(Seurat)
+library(cowplot)
+library(slingshot)
+library(tradeSeq)
+library(SeuratWrappers)
+library(monocle3)
+library(patchwork)
+library(Matrix)
+library(fields)
+library(tidyverse)
+library(plotly)
+library(RColorBrewer)
+library(rafalib)
+
+for (d in c("data/scrna", "results/Brain_Cd45_HG/Targeted_genes", "results/Brain_Cd45_HG/Trajectory", "results/Brain_Cd45_HG/NicheNet", "results/Brain_Cd45_HG/tradeseq_input")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# Trajectory
+## Slingshot
+```{r Subset the related dataset}
+DATA <- readRDS("data/scrna/Cd45_HG.rds")
+DATA <- SetIdent(DATA, value = "Subtypes2") %>% subset(idents = c( "Monocyte 3", "Monocyte 4", "Monocyte 5", "Monocyte 6", "Macrophage 2","HG_3", "Macrophage 1", "Monocyte 1", "Monocyte 2"))
+DefaultAssay(DATA )<- "RNA"
+
+# Redo Umap with different number of dimensions----
+for (dims in c(25, 30, 40, 50)) {
+DATA <- RunUMAP(DATA, reduction = "harmony", dims = 1:dims, reduction.name = paste0("umap.harmony.", dims), n.components = 2)
+}
+plot_grid(
+DimPlot(DATA, reduction = "umap.harmony.50", group.by = "Subtypes2", label = T),
+DimPlot(DATA, reduction = "umap.harmony.40", group.by = "Subtypes2", label = T),
+DimPlot(DATA, reduction = "umap.harmony.30", group.by = "Subtypes2", label = T),
+DimPlot(DATA, reduction = "umap.harmony.25", group.by = "Subtypes2", label = T)
+)
+```
+
+```{r refine the cells to make Umap better}
+DATA <- FindNeighbors(DATA,
+                      reduction = "harmony",
+                      assay = "RNA",
+                      nn.method = "annoy",
+                      annoy.metric = "cosine",
+                      dims = 1:50,
+                      k.param=5)
+
+DATA <- FindClusters(DATA,resolution = 2.5, graph.name = "RNA_snn")
+
+DimPlot(DATA, reduction = "umap.harmony.50", group.by = "RNA_snn_res.2.5", label = T)
+table(DATA$Subtypes2, DATA$RNA_snn_res.2.5)
+
+# remove the small clusters that lie away from the rest of the cells
+DATA <- SetIdent(DATA, value = "RNA_snn_res.2.5") %>% subset(idents = c(0:18,22,24,26))
+```
+
+```{r Trajectory UMAP}
+DATA <- RunUMAP(DATA, dims = 1:50,
+                reduction = "harmony",
+                reduction.name = "umap_traj",
+                n.neighbors = 20,
+                repulsion.strength = 0.05,
+                negative.sample.rate = 20,
+                n.epochs =100,
+                n.components = 2 )
+DimPlot(DATA, reduction = "umap_traj", group.by = "Subtypes2", label = T)
+
+DATA <- RunUMAP(DATA, reduction = "harmony", dims = 1:50, reduction.name = "umap_traj_3d", n.components = 3)
+
+df <- data.frame(DATA@reductions$umap_traj_3d@cell.embeddings, variable = factor(DATA$Subtypes2))
+colnames(df)[1:3] <- c("UMAP_1", "UMAP_2", "UMAP_3")
+p_State <- plot_ly(df, x = ~UMAP_1, y = ~UMAP_2, z = ~UMAP_3, color = ~variable, size = 0.5)
+htmlwidgets::saveWidget(p_State, selfcontained = T, "results/Brain_Cd45_HG/Trajectory/umap_3d_clustering_plotly.html")
+p_State
+```
+
+```{r Get Lineage}
+#Give subtypes numbers to visualize
+DATA$Subtypes <- as.character(DATA$Subtypes2)
+new.cluster.ids <- 0:8
+DATA <- SetIdent(DATA, value = "Subtypes")
+names(new.cluster.ids) <- unique(DATA$Subtypes)
+DATA <- RenameIdents(DATA,new.cluster.ids)
+DATA$Subtypes2 <- DATA@active.ident
+
+mm <- sparse.model.matrix(~0 + factor(DATA$Subtypes))
+colnames(mm) <- levels(factor(DATA$Subtypes))
+centroids2d <- as.matrix(t(t(DATA@reductions$umap_traj@cell.embeddings) %*% mm)/Matrix::colSums(mm))
+
+#Trajectory imputation----
+set.seed(1)
+lineages <- as.SlingshotDataSet(getLineages(
+  data           = DATA@reductions$umap_traj_3d@cell.embeddings,
+  clusterLabels  = DATA$Subtypes,
+  end.clus       = c("Monocyte 3"),       #Define the lineage end
+  start.clus     = "Monocyte 2"
+  ))
+lineages
+
+#Plot Lineage
+lineages@reducedDim <- DATA@reductions$umap_traj@cell.embeddings
+pal_clusters <- c((scales::hue_pal())(8),RColorBrewer::brewer.pal(9, "Set1"), RColorBrewer::brewer.pal(8,"Set2"))
+
+plot(DATA@reductions$umap_traj@cell.embeddings, col = pal_clusters[DATA$Subtypes2],  cex=.5,pch = 16)
+lines(lineages, lwd = 1, col = 'black', cex=1 )
+text(centroids2d, labels = rownames(centroids2d),cex=0.8,font=2,col = "black")
+```
+
+```{r Principal Curve}
+curves <- as.SlingshotDataSet(getCurves(data = lineages, thresh = 0.01, stretch = 0.1, allow.breaks = F, approx_points = 1000))
+plot(DATA@reductions$umap_traj@cell.embeddings, col = pal_clusters[DATA$Subtypes2], pch = 16)
+lines(curves, lwd = 2, col = "black")
+text(centroids2d, labels = rownames(centroids2d), cex = 1, font = 2)
+```
+Lineage1: Monocyte 2  Monocyte 4  Macrophage 1
+Lineage2: Monocyte 2  Monocyte 6  Macrophage 2
+Lineage3: Monocyte 2  Monocyte 1  HG_3
+Lineage4: Monocyte 2  Monocyte 5
+Lineage5: Monocyte 2  Monocyte 3
+
+### Pesudotime
+```{r}
+#Compute pseudotime----
+pseudotime <- slingPseudotime(curves, na = FALSE)
+cellWeights <- slingCurveWeights(curves)
+
+pseu <- as.data.frame(pseudotime)
+DATA2 <- DATA
+for (i in 1:5) {
+DATA2 <- AddMetaData(DATA2, pseu[[paste0("Lineage", i)]], col.name = paste0("Slingshot_", i))
+}
+saveRDS(DATA2, "data/scrna/Slingshot.rds")
+
+lineage_names <- c("Mono2-Mono4-Mac1", "Mono2-Mono6-Mac2", "Mono2-Mono1-HG_3", "Mono2-Mono5", "Mono2-Mono3")
+lineage_ends <- c("Macrophage 1", "Macrophage 2", "HG_3", "Monocyte 5", "Monocyte 3")
+
+pdf("results/Brain_Cd45_HG/Trajectory/Slinsghot_Vln.pdf", width = 8, height = 4.9 )
+for (i in 1:5) {
+print(VlnPlot(DATA2, features = paste0("Slingshot_", i), group.by = "Condition")+ggtitle(lineage_names[i]))
+}
+dev.off()
+
+subtype_colors <- c("Monocyte 1"="#C6D04E",   "Monocyte 2" =  "#E6B815" ,    "Monocyte 3"=  "#F79F83", "Monocyte 4" ="#EF5990",  "Monocyte 5" ="#CE1D75",  "Monocyte 6" = "#910241", "Macrophage 1"= "#2992A7", "Macrophage 2" = "#47CDD8" , "Macrophage 3"= "#ABB3D0", "HG_3" = "#AEDFC1")
+condition_colors <- c("PBS" = "navy", "AEC" = "#FC4100")
+
+pseu2 <- DATA2@meta.data[c(paste0("Slingshot_", 1:5), "Condition", "Subtypes")]
+
+pdf("results/Brain_Cd45_HG/Trajectory/Slinsghot_Box.pdf", width = 8, height = 3 )
+for (i in 1:5) {
+print(ggplot(pseu2, aes(x=Condition, y=.data[[paste0("Slingshot_", i)]], color = Condition)) +
+    geom_jitter(aes(fill = Subtypes),stroke =0.5, color = "black",shape = 21,  size=3, alpha=0.9) +
+    geom_boxplot( outliers = F, alpha = 0 )+
+    scale_fill_manual("Cell Subtypes", values = subtype_colors)+
+    scale_color_manual("Conditions", values = condition_colors)+
+    theme_classic() +
+    theme(plot.title = element_text(size=11)) +
+    coord_flip()+
+    ggtitle(paste("Trajectory", i)) +
+    ylab(paste0("Monocyte 2 ← pseudotime → ", lineage_ends[i])))
+}
+dev.off()
+```
+
+```{r}
+x <- rowMeans(pseudotime)
+x <- x/max(x)
+o <- order(x)
+pal = colorRampPalette(c("#2D2F80", "#9D2F92", "#F68948", "#ECE832"))
+
+lc <- sapply(lineages@lineages, function(x) {
+  rev(x)[1]
+})
+names(lc) <- gsub("Lineage", "L", names(lc))
+
+pdf("results/Brain_Cd45_HG/Trajectory/Slinsghot_Vln2.pdf", width = 8, height = 4.9 )
+plot(DATA@reductions$umap_traj@cell.embeddings[o, ], main = paste0("pseudotime"), pch = 16,
+    cex = 1, axes = T, xlab = "", ylab = "",col = pal(99)[x[o] * 98 + 1])
+lines(curves, lwd = 2, col = "black")
+fields::colorbar.plot( 5, 2.5,  1:99, horizontal = F,col = pal(99))
+text(centroids2d, labels = rownames(centroids2d), cex = 1, font = 2)
+points(centroids2d[lc, ], col = "black", pch = 16, cex = 4)
+text(centroids2d[lc, ], labels = names(lc), cex = 1, font = 2, col = "white")
+
+print(VlnPlot(DATA2, features = paste0("Slingshot_", 1:5), group.by = "Condition"))
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Trajectory/Pseudotime.pdf", width = 13, height = 4.9 )
+#plot pseudotime together with clusters
+par(mar = c(4,4,2,2), xpd = T, mfrow = c(1,2))
+plot(DATA@reductions$umap_traj@cell.embeddings, col = pal_clusters[DATA$Subtypes2],  cex=.5,pch = 16)
+text(centroids2d, labels = rownames(centroids2d),cex=0.8,font=2,col = "black")
+plot(DATA@reductions$umap_traj@cell.embeddings[o, ], main = paste0("pseudotime"), pch = 16,
+    cex = 0.4, axes = T, xlab = "", ylab = "", col = pal(99)[x[o] * 98 + 1])
+dev.off()
+```
+
+### TradeSeq
+fitGAM was run on UPPMAX with the files saved here. The fitted models were saved as `GAM2.rds` (without condition) and `GAM_condition.rds` (with condition).
+```{r TradeSeq input}
+count <- LayerData(DATA2, assay = "RNA", layer = "counts")
+
+saveRDS(count, "results/Brain_Cd45_HG/tradeseq_input/count.rds")
+saveRDS(pseudotime, "results/Brain_Cd45_HG/tradeseq_input/pseudotime.rds")
+saveRDS(cellWeights, "results/Brain_Cd45_HG/tradeseq_input/cellWeights.rds")
+saveRDS(VariableFeatures(readRDS("data/scrna/Cd45_HG.rds")),"results/Brain_Cd45_HG/tradeseq_input/genes.rds")
+saveRDS(DATA2$Condition,"results/Brain_Cd45_HG/tradeseq_input/condition.rds")
+```
+
+After UPPMAX
+```{r}
+sceGAM <- readRDS("data/scrna/GAM2.rds")
+sce <- readRDS("data/scrna/GAM_condition.rds")
+plotGeneCount(curves, clusters = DATA2$Subtypes, models = sceGAM)
+```
+
+#### TradeSeq between Condition
+```{r}
+condRes <- conditionTest(sce, l2fc = log2(2))
+condRes$padj <- p.adjust(condRes$pvalue, "fdr")
+mean(condRes$pvalue <= 0.05, na.rm = TRUE)
+sum(condRes$pvalue <= 0.05, na.rm = TRUE)
+write.csv(condRes, file = "results/Brain_Cd45_HG/Trajectory/Condition_DE.csv")
+
+oo <- order(condRes$waldStat, decreasing = TRUE)
+plotSmoothers(sce, assays(sce)$counts,
+              gene = rownames(assays(sce)$counts)[oo[1]],
+              alpha = 1, border = TRUE)
+
+traj_colors <- c("#440154","#297093","#F15A29","#EFD137","#8D0A17")
+
+plot_list = list()
+for(i in c("Adgre4", "Saa3","Tfec" , "Ccl24", "Hmgb2", "Alox15")){
+plot_list[[i]] = plotSmoothers(sce, assays(sce)$counts,
+              gene = i,
+              alpha = 1,curvesCols = traj_colors, border = TRUE) + ggtitle(i) + scale_color_manual (values = traj_colors)
+}
+pdf("results/Brain_Cd45_HG/Trajectory/Traj_genes.pdf", width = 12, height = 5)
+plot_grid(plotlist =  plot_list)
+dev.off()
+
+plot_list = list()
+for(i in c("Mrc1", "Arg1", "Pdcd1lg2")){
+plot_list[[i]] = plotSmoothers(sce, assays(sce)$counts,
+              gene = i,
+              alpha = 1,curvesCols = traj_colors, border = TRUE) + ggtitle(i) + scale_color_manual (values = traj_colors)
+}
+pdf("results/Brain_Cd45_HG/Trajectory/Arg1_Mrc1_Pdcd1.pdf", width = 8, height = 5)
+plot_grid(plotlist =  plot_list, ncol = 2)
+dev.off()
+```
+
+#### Early drivers
+```{r}
+earlyDERes <- earlyDETest(sce, knots = c(1, 2))
+oEarly <- order(earlyDERes$waldStat, decreasing = TRUE)
+head(rownames(earlyDERes)[oEarly])
+
+write.csv(earlyDERes, file = "results/Brain_Cd45_HG/Trajectory/Early_driver_DE.csv")
+
+plot = list()
+for(i in 31:60){
+  gene <- rownames(earlyDERes)[oEarly][i]
+  plot[[gene]]=plotSmoothers(sce, assays(sce)$counts, gene = gene)+ggtitle(gene)
+}
+pdf("results/Brain_Cd45_HG/Trajectory/EarlyDriver_31_60.pdf", width = 30, height = 20)
+plot_grid(plotlist =  plot)
+dev.off()
+```
+
+#### DEG between lineages
+```{r}
+patternRes <- patternTest(sce)
+oPat <- order(patternRes$waldStat, decreasing = TRUE)
+head(rownames(patternRes)[oPat])
+
+write.csv(patternRes, file = "results/Brain_Cd45_HG/Trajectory/Lineages_DE.csv")
+
+plot = list()
+for(i in 31:60){
+  gene <- rownames(patternRes)[oPat][i]
+  plot[[gene]]=plotSmoothers(sce, assays(sce)$counts, gene = gene)+ggtitle(gene)
+}
+pdf("results/Brain_Cd45_HG/Trajectory/Lineages_DE_31_60.pdf", width = 30, height = 20)
+plot_grid(plotlist =  plot)
+dev.off()
+```
+
+#### Selected Genes
+```{r}
+genes = c("Adgre4","Itgal", "Saa3","Cacna1d","Tfec", "Tgm2","Ccl4", "Arg1", "S100a10","Hmgb2")
+plot = list()
+
+legend = get_legend(plotSmoothers(sce, assays(sce)$counts, gene = "Tfec"))
+
+for(i in 1:length(genes)){
+  print(genes[i])
+  plot[[i]]=plotSmoothers(sce, assays(sce)$counts, gene = genes[i],size = 0.3, lwd = 0.8, alpha = 0.8, nPoints = 50) +ggtitle(genes[i]) +theme(legend.position = "none",axis.title.y = element_blank())
+}
+plot[[length(genes)+1]] = legend
+
+pdf("results/Brain_Cd45_HG/Trajectory/Trajectory_genes.pdf", width =10, height = 5)
+plot_grid(plotlist =  plot)
+dev.off()
+```
+
+#### Genes along pseudotime (model without condition)
+```{r}
+#Save the psudotime association Genelist
+res <- na.omit(associationTest(sceGAM, contrastType = "consecutive"))
+res <- res[res$pvalue < 0.005, ]
+res <- res[res$waldStat > mean(res$waldStat), ]
+res <- res[order(res$waldStat, decreasing = T), ]
+res$gene <- rownames(res)
+write_csv(res, "results/Brain_Cd45_HG/Trajectory/Psudo_Gene.csv")
+
+#Save the gene list between two psudotime point
+res <- na.omit(startVsEndTest(sceGAM, pseudotimeValues = c(2.5, 6.25), lineages = T))
+res <- res[res$pvalue_lineage2 < 0.05, ]
+res <- res[res$waldStat > mean(res$waldStat), ]
+res <- res[order(res$waldStat, decreasing = T), ]
+res$gene <- rownames(res)
+write_csv(res, "results/Brain_Cd45_HG/Trajectory/2.5_6.25_DE.csv")
+
+#Genes that are different between lineage ends
+res <- na.omit(diffEndTest(sceGAM))
+res <- res[res$pvalue < 0.001, ]
+res <- res[res$waldStat > mean(res$waldStat), ]
+res <- res[order(res$waldStat, decreasing = T), ]
+res$gene <- rownames(res)
+write_csv(res, "results/Brain_Cd45_HG/Trajectory/DiffEnd_Gene.csv")
+
+#Plot Top 7 Genes
+plot_list = list()
+for (sigGeneStart in res$gene[1:7]){
+print(sigGeneStart)
+plot_list[[sigGeneStart]]<- plotSmoothers(sceGAM, counts=drop0(count), gene = sigGeneStart) + ggtitle(sigGeneStart)
+}
+plot_grid(ncol = 2, plotlist = plot_list)
+```
+
+## Monocle 3
+
+```{r Subset the related dataset for Monocle}
+DATA <- readRDS("data/scrna/Cd45_HG.rds")
+DATA <- SetIdent(DATA, value = "Subtypes2") %>% subset(idents = c("Monocyte 3", "Monocyte 4", "Monocyte 5", "Monocyte 6", "Macrophage 2","HG_3", "Macrophage 1"))
+DATA$Subtypes <- as.character(DATA$Subtypes2)
+
+DATA <- RunUMAP(DATA, reduction = "harmony", dims = 1:40, reduction.name = "umap.harmony", n.components = 2)
+
+DATA <- FindNeighbors(DATA,
+                      reduction = "harmony",
+                      assay = "RNA",
+                      nn.method = "annoy",
+                      annoy.metric = "cosine",
+                      dims = 1:50,
+                      k.param=5)
+
+DATA <- FindClusters(DATA,resolution = 2, graph.name = "RNA_snn")
+DimPlot(DATA, reduction = "umap.harmony", group.by = "RNA_snn_res.2", label = T)
+
+# remove the small clusters that lie away from the rest of the cells
+DATA <- SetIdent(DATA, value = "RNA_snn_res.2") %>% subset(idents = c(0:17, 20))
+
+DATA <- RunUMAP(DATA, reduction = "harmony", dims = 1:40, reduction.name = "UMAP", n.components = 2)
+DimPlot(DATA, reduction = "UMAP", group.by = "Subtypes", label = T)
+```
+
+```{r set up cell_data_set object}
+DATA@reductions$umap.unintegrated <- NULL
+DATA@reductions$harmony <- NULL
+DATA@reductions$umap.harmony <- NULL
+
+data <- as.cell_data_set(DATA)
+data <- cluster_cells(data, resolution = 1e-2)
+
+p1 <- plot_cells(data, color_cells_by = "cluster", show_trajectory_graph = FALSE, cell_size = 1)
+p2 <- plot_cells(data, color_cells_by = "partition", show_trajectory_graph = FALSE)
+wrap_plots(p1, p2)
+
+data <- learn_graph(data, use_partition = TRUE, verbose = FALSE)
+
+plot_cells(data,
+           color_cells_by = "cluster",
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE, cell_size = 0.8, group_label_size = 5)
+```
+
+### Pesudotime
+```{r }
+# Monocle cluster 6 is used as the root
+data <- order_cells(data, root_cells = colnames(data[,clusters(data) == 6]))
+
+plot_cells(data,
+           color_cells_by = "pseudotime",
+           group_cells_by = "cluster",
+           label_cell_groups = F,
+           label_groups_by_cluster=FALSE,
+           label_leaves=T,
+           label_branch_points=F,
+           label_roots = FALSE,
+           trajectory_graph_color = "grey30", cell_size = 0.8)
+
+DATA <- AddMetaData(DATA, metadata = pseudotime(data), col.name = "Monocle3_pseudotime")
+DATA <- AddMetaData(DATA, metadata = clusters(data), col.name = "monocle3_clusters")
+
+FeaturePlot(DATA, "Monocle3_pseudotime", split.by = "Condition")
+VlnPlot(DATA, features = "Monocle3_pseudotime", group.by = "Subtypes", split.by = "Condition" )
+
+pdf("results/Brain_Cd45_HG/Trajectory/Monocle_Vln.pdf", width = 8, height = 4.9 )
+plot_grid(
+VlnPlot(SetIdent(DATA, value = "monocle3_clusters") %>% subset(idents = c(6, 2,9 ,4)), features = "Monocle3_pseudotime", group.by = "Condition") + ggtitle("Pseudotime", subtitle = "Lineage 9"),
+VlnPlot(SetIdent(DATA, value = "monocle3_clusters") %>% subset(idents = c( 6, 2,9 ,3)), features = "Monocle3_pseudotime", group.by = "Condition") + ggtitle("Pseudotime", subtitle = "Lineage 7"),
+VlnPlot(SetIdent(DATA, value = "monocle3_clusters") %>% subset(idents = c( 6, 7)), features = "Monocle3_pseudotime", group.by = "Condition") + ggtitle("Pseudotime", subtitle = "Lineage 4"),
+VlnPlot(SetIdent(DATA, value = "monocle3_clusters") %>% subset(idents = c( 6, 1)), features = "Monocle3_pseudotime", group.by = "Condition") + ggtitle("Pseudotime", subtitle = "Lineage 2"),
+VlnPlot(SetIdent(DATA, value = "monocle3_clusters") %>% subset(idents = c( 6, 8,5)), features = "Monocle3_pseudotime", group.by = "Condition") + ggtitle("Pseudotime", subtitle = "Lineage 6"))
+plot_cells(data,
+           color_cells_by = "pseudotime",
+           group_cells_by = "cluster",
+           label_cell_groups = F,
+           label_groups_by_cluster=FALSE,
+           label_leaves=T,
+           label_branch_points=F,
+           label_roots = FALSE,
+           trajectory_graph_color = "grey30", cell_size = 0.8)
+dev.off()
+```

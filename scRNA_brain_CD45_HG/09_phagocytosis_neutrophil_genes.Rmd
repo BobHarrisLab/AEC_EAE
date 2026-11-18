@@ -1,0 +1,84 @@
+---
+title: "Brain CD45 and HG cells: phagocytosis score and neutrophil genes"
+output: html_document
+---
+
+Brain CD45+ immune cells and high granularity (HG) cells from PBS- and AEC-treated mice (GEO: GSE301590).
+
+Phagocytosis module score, neutrophil genes and cell cycle scores in myeloid and HG cells.
+Starts from `data/scrna/Cd45_HG.rds`, saved by `02_merge_CD45_HG.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load the packages
+```{r Load the Packages}
+library(Seurat)
+library(cowplot)
+library(patchwork)
+library(Matrix)
+library(tidyverse)
+library(RColorBrewer)
+
+for (d in c("data/scrna", "results/Brain_Cd45_HG/Targeted_genes", "results/Brain_Cd45_HG/Trajectory", "results/Brain_Cd45_HG/NicheNet", "results/Brain_Cd45_HG/tradeseq_input")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# Check Phagocytosis Score
+```{r Check the phagocytosis}
+DATA <- readRDS("data/scrna/Cd45_HG.rds")
+DATA <- SetIdent(DATA, value = "Celltypes") %>% subset(idents = c("Monocytes", "Neutrophil", "Macrophages", "Microglia", "High Granularity Cells"))
+
+#GO0050766 positive regulation of phagocytosis
+GO0050766 <- unique(c("Abca7", "Abr", "Ager", "Ahsg", "Ano6", "Apoa1", "Apoa2", "Appl2", "Bcr", "Btk", "C2", "C3", "Calr", "Camk1d", "Ccl2", "Ccr7", "Cd36", "Cd47", "Cd209b", "Cd300lf", "Cfp", "Clec7a", "Colec10", "Colec11", "Cyba", "Dnm2", "Dock2", "F2rl1", "Fcer1g", "Fcgr1", "Fcgr2b", "Fcgr3", "Fpr2", "Fpr3", "Fpr-rs3", "Fpr-rs4", "Fpr-rs6", "Fpr-rs7", "Gas6", "Gata2", "Gm5150", "Ifng", "Igh-8", "Ighg1", "Ighg2a", "Ighg2b", "Il2rb", "Il2rg", "Il15", "Il15ra", "Itga2", "Klrh1", "Lbp", "Lman2", "Lrp1", "Lyar", "Mbl1", "Mbl2", "Mertk", "Mex3b", "Mfge8", "Myh9", "Myo18a", "Nckap1l", "Nod2", "Pla2g5", "Plcg2", "Pparg", "Pros1", "Ptk2", "Ptprc", "Ptprj", "Ptx3", "Pycard", "Rab27a", "Rab31", "Rap1a", "Rap1gap", "Rapgef1", "Sftpa1", "Sftpd", "Sirpa", "Sirpb1a", "Sirpb1b", "Sirpb1c", "Sirpd", "Slc11a1", "Sod1", "Stap1", "Trem2", "Tub", "Tulp1"))
+
+#GO0060100 positive regulation of phagocytosis, engulfment
+GO0060100 <- unique(c("Abca7", "Ager", "Ano6", "Appl2", "C3", "Cd36", "F2rl1", "Fcgr1", "Gata2", "Itga2", "Lbp", "Nckap1l", "Plcg2", "Pparg", "Rab31", "Stap1", "Trem2"))
+
+#GO0006910 Phagocytosis recognition
+GO0006910 <- unique(c("Adgrb1", "C4bp", "Cd36", "Cd47", "Cd209b", "Cfp", "Clec7a", "Colec10", "Colec11", "Colec12", "Fcgr1", "Fcgr3", "Igh-8", "Ighg1", "Ighg2a", "Ighg2b", "Jmjd6", "Klrh1", "Mbl2", "Megf10", "Mfge8", "Myo18a", "Pear1", "Pla2g5", "Ptx3", "Scarb1", "Sftpd", "Sirpa", "Spon2", "Trem2", "Tub", "Tulp1", "Zp3r"))
+
+#Phagocytosis (used for the score)
+phagocytosis <- c("4933434E20Rik", "Abca1", "Abca7", "Abl1", "Abl2", "Abr", "Adgrb1", "Ager", "Ahsg", "Aif1", "Alox15", "Ano6", "Anxa1", "Anxa3", "Anxa11", "Apoa1", "Apoa2", "Appl2", "Arhgap12", "Arhgap25", "Arl8b", "Axl", "BC053393", "Bcr", "Becn1", "Bin2", "Bltp1", "Btk", "C2", "C3", "C4b", "C4bp", "Calr", "Camk1d", "Ccl2", "Ccr2", "Ccr7", "Cd36", "Cd47", "Cd209b", "Cd300lf", "Cd302", "Cdc42", "Cdc42se1", "Cdc42se2", "Cebpe", "Cfb", "Cfp", "Clcn3", "Clec7a", "Cln3", "Cnn2", "Colec10", "Colec11", "Colec12", "Coro1a", "Coro1c", "Cryba1", "Cyba", "Dnm2", "Dock1", "Dock2", "Dppa1", "Eif2ak1", "Elane", "Elmo1", "Elmo2", "Elmo3", "F2rl1", "Fcer1g", "Fcgr1", "Fcgr2b", "Fcgr3", "Fgr", "Fpr2", "Fpr3", "Fpr-rs3", "Fpr-rs4", "Fpr-rs6", "Fpr-rs7", "Gas6", "Gata2", "Gm5150", "Gm12169", "Gsn", "Gulp1", "Havcr1", "Hck", "Hmgb1", "Icam5", "Ifng", "Igh-8", "Ighg1", "Ighg2a", "Ighg2b", "Il1b", "Il2rb", "Il2rg", "Il15", "Il15ra", "Irf8", "Itga2", "Itgal", "Itgam", "Itgav", "Itgb1", "Itgb2", "Itgb3", "Jmjd6", "Klrh1", "Lbp", "Ldlr", "Lep", "Lepr", "Letmd1", "Lman2", "Lrp1", "Lyar", "Lyst", "Marco", "Masp1", "Masp2", "Mbl1", "Mbl2", "Megf10", "Mertk", "Mesd", "Met", "Mex3b", "Mfge8", "Msr1", "Mst1r", "Myd88", "Myh9", "Myo1g", "Myo7a", "Myo18a", "Ncf2", "Ncf4", "Nckap1l", "Nfix", "Nod2", "Nr1h3", "P2rx7", "P2ry6", "Pear1", "Pecam1", "Pik3ca", "Pikfyve", "Pip5k1c", "Pla2g5", "Plcg2", "Pld4", "Pot1b", "Pparg", "Prkcg", "Pros1", "Ptk2", "Ptprc", "Ptprj", "Ptx3", "Pycard", "Rab5a", "Rab7", "Rab7b", "Rab11fip2", "Rab14", "Rab20", "Rab27a", "Rab31", "Rab34", "Rab39", "Rac1", "Rac3", "Rap1a", "Rap1gap", "Rapgef1", "Rara", "Scarb1", "Sftpa1", "Sftpd", "Sh3bp1", "Siglece", "Sirpa", "Sirpb1a", "Sirpb1b", "Sirpb1c", "Sirpd", "Slamf1", "Slc11a1", "Sod1", "Spg11", "Sphk1", "Spon2", "Srpx", "Stap1", "Syk", "Syt7", "Tafa4", "Tgm2", "Thbs1", "Ticam2", "Timd2", "Timd4", "Tlr4", "Tm9sf4", "Tmem175", "Tnf", "Trem2", "Treml4", "Trex1", "Tub", "Tulp1", "Tusc2", "Tyro3", "Tyrobp", "Unc13d", "Vamp7", "Vav1", "Washc5", "Xkr4", "Xkr5", "Xkr6", "Xkr7", "Xkr8", "Xkr9", "Zp3r")
+
+DATA <- AddModuleScore(DATA,features = list(intersect(phagocytosis, rownames(DATA))),name = "Phagocytosis.Score")
+FeaturePlot(DATA, features = "Phagocytosis.Score1",repel = TRUE, reduction = "umap.harmony")+ scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+pdf(file = "results/Brain_Cd45_HG/phago_subtypes.pdf", width = 12, height =6)
+VlnPlot(DATA, features = "Phagocytosis.Score1", group.by = "Subtypes2")
+VlnPlot(DATA,features = "Phagocytosis.Score1", group.by = "Subtypes2", split.by = "Condition")
+dev.off()
+
+pdf(file = "results/Brain_Cd45_HG/phago_subtypes_nodot.pdf", width = 12, height =6)
+VlnPlot(DATA, features = "Phagocytosis.Score1", group.by = "Subtypes2", pt.size = 0)
+VlnPlot(DATA,features = "Phagocytosis.Score1", group.by = "Subtypes2", split.by = "Condition", pt.size = 0)
+dev.off()
+```
+
+# Neutrophil genes and proliferation
+```{r }
+DATA <- readRDS("data/scrna/Cd45_HG.rds")
+DATA2 <- SetIdent(DATA, value = "Celltypes") %>% subset(idents = c( "High Granularity Cells", "Neutrophil", "Monocytes", "Macrophages")) %>%  NormalizeData()
+
+neutrophil_genes <- c("Ly6g", "Gsr","Csf1r", "Adgre1", "Cx3cr1", "Fpr2", "Cmklr1", "Gpr18","Ifitm6","Retnlg", "Ccr2","Cd14", "Ly6c1","Ly6c2")
+pdf(file = "results/Brain_Cd45_HG/Neutrophil_Genes.pdf", width = 8, height =6)
+VlnPlot(DATA2, features = neutrophil_genes,group.by = "Subtypes", stack = T, flip = T)
+dev.off()
+DotPlot(DATA2, features = neutrophil_genes,group.by = "Subtypes")+coord_flip()
+
+pdf(file = "results/Brain_Cd45_HG/prolif_subtypes.pdf", width = 12, height =6)
+VlnPlot(DATA2, features = "S.Score", group.by = "Subtypes")
+VlnPlot(DATA2,features = "S.Score", group.by = "Subtypes", split.by = "Condition")
+VlnPlot(DATA2, features = "G2M.Score", group.by = "Subtypes")
+VlnPlot(DATA2,features = "G2M.Score", group.by = "Subtypes", split.by = "Condition")
+dev.off()
+
+pdf(file = "results/Brain_Cd45_HG/prolif_subtypes_nodot.pdf", width = 12, height =6)
+VlnPlot(DATA2, features = "S.Score", group.by = "Subtypes", pt.size = 0)
+VlnPlot(DATA2,features = "S.Score", group.by = "Subtypes", split.by = "Condition", pt.size = 0)
+VlnPlot(DATA2, features = "G2M.Score", group.by = "Subtypes", pt.size = 0)
+VlnPlot(DATA2,features = "G2M.Score", group.by = "Subtypes", split.by = "Condition", pt.size = 0)
+dev.off()
+```

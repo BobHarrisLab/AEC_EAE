@@ -1,0 +1,112 @@
+---
+title: "Brain CD45 and HG cells: selected genes"
+output: html_document
+---
+
+Brain CD45+ immune cells and high granularity (HG) cells from PBS- and AEC-treated mice (GEO: GSE301590).
+
+Violin and dot plots of selected genes per subtype and condition.
+Starts from `data/scrna/Cd45_HG.rds`, saved by `02_merge_CD45_HG.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load the packages
+```{r Load the Packages}
+library(Seurat)
+library(cowplot)
+library(patchwork)
+library(Matrix)
+library(tidyverse)
+
+for (d in c("data/scrna", "results/Brain_Cd45_HG/Targeted_genes", "results/Brain_Cd45_HG/Trajectory", "results/Brain_Cd45_HG/NicheNet", "results/Brain_Cd45_HG/tradeseq_input")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# Targeted Genes
+
+```{r Plot Clec7a and OSM}
+DATA <- readRDS("data/scrna/Cd45_HG.rds")
+DATA_Myeloid <- SetIdent(DATA, value = "Celltypes") %>% subset(idents = c("Monocytes", "Macrophages", "High Granularity Cells"))
+DATA.T <- SetIdent(DATA, value = "Celltypes") %>% subset(idents = c("T Cells"))
+DATA2 <- SetIdent(DATA, value = "Celltypes") %>% subset(idents = c("Monocytes", "Macrophages", "Microglia","High Granularity Cells"))
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/MHCII_Cleac7a.pdf",width = 7, height = 5)
+VlnPlot(DATA2, features = c("Adgre1", "Clec7a", "H2-Aa",   "H2-Ab1",  "H2-DMa",  "H2-DMb1","H2-Eb1"  ,"Cd74"),group.by = "Subtypes2", split.by = "Condition", stack = T, flip = T)
+VlnPlot(DATA2, features = c("Adgre1", "Clec7a", "H2-Aa",   "H2-Ab1",  "H2-DMa",  "H2-DMb1","H2-Eb1"  ,"Cd74"),group.by = "Subtypes2",stack = T, flip = T)
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/Pglyrp1_Fabp4.pdf",width = 10, height =10)
+VlnPlot(DATA, features = c("Pglyrp1", "Fabp4","Hif3a","Hif1a","Epas1","Mafb"),group.by = "Subtypes2", split.by = "Condition", stack = T, flip = T)
+VlnPlot(DATA, features = c("Pglyrp1", "Fabp4","Hif3a","Hif1a","Epas1","Mafb"),group.by = "Subtypes2",stack = T, flip = T)
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/MTCs.pdf",width = 10, height =5)
+VlnPlot(DATA, features = c("Slc16a3", "Slc16a6","Slc16a7"),group.by = "Subtypes2", split.by = "Condition", stack = T, flip = T)
+VlnPlot(DATA, features = c("Slc16a3", "Slc16a6","Slc16a7") ,group.by = "Subtypes2",stack = T, flip = T)
+dev.off()
+
+cytokines <- unique(c("Il11", "Il1b", "Tgfb1", "Tnfsf10", "Tnfsf8",  "Ccl2", "Ccl6", "Ccl7", "Ccl8", "Ccl9", "Ccl12", "Ccl22", "Cxcl9","Cxcl10","Cxcl16","Ccr1","Ccr2", "Ccr5", "Ccr7",  "Csf2rb", "Csf2rb2", "Lyz2"))
+pdf("results/Brain_Cd45_HG/Targeted_genes/Cytokines.pdf",width = 15, height =10)
+VlnPlot(DATA, features = cytokines ,group.by = "Subtypes2", split.by = "Condition", stack = T, flip = T)
+VlnPlot(DATA, features = cytokines ,group.by = "Subtypes2",stack = T, flip = T)
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/TCell_TNF.pdf",width = 8, height =3)
+DotPlot(DATA.T, c("Tnf", "Cd69"), group.by = "Condition", scale=F) +scale_size( range = c(4,6))+coord_flip()
+dev.off()
+VlnPlot(DATA.T, features = c("Tnf"),group.by = "Condition")
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/SiglecF.pdf",width = 10, height =7)
+VlnPlot(DATA_Myeloid, features = c("Ccr3", "Ccr1","Siglecf","Ccl24", "Tfec"),  group.by = "Subtypes", split.by = "Condition", stack = T, flip = T)
+VlnPlot(DATA_Myeloid, features = c("Ccr3", "Ccr1","Siglecf","Ccl24", "Tfec", "Il4ra", "Il5ra"),  group.by = "Subtypes", split.by = "Condition")
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/Il3_Il5.pdf",width = 10, height =7)
+VlnPlot(DATA, features = c("Il3","Il5"),  group.by = "Subtypes", split.by = "Condition")
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/Gatm_Gamt.pdf",width = 10, height =7)
+VlnPlot(DATA_Myeloid, features = c("Gatm","Gamt"),  group.by = "Subtypes", split.by = "Condition", stack = T, flip = T)
+VlnPlot(DATA_Myeloid, features = c("Gatm","Gamt"),  group.by = "Subtypes", split.by = "Condition")
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/Ctla4_Cd80.pdf",width = 10, height =7)
+VlnPlot(DATA, features = c("Ctla4","Cd28","Pdcd1lg2", "Cd80","Cd86"),  group.by = "Subtypes2", split.by = "Condition", cols = c("#8F5C98","#30409A"), stack = T,flip = T, split.plot = T)
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/CSF2.pdf",width = 10, height =7)
+VlnPlot(DATA_Myeloid, features = c("Csf2", "Csf2rb", "Csf2ra"),  group.by = "Subtypes2", split.by = "Condition", stack = T, flip = T, cols = c("#8F5C98","#30409A"))
+VlnPlot(DATA_Myeloid, features = c("Csf2", "Csf2rb", "Csf2ra"),  group.by = "Subtypes", split.by = "Condition", cols = c("#8F5C98","#30409A"))
+VlnPlot(DATA_Myeloid, features = c("Csf2", "Csf2rb", "Csf2ra"),  group.by = "Subtypes", split.by = "Condition", cols = c("#8F5C98","#30409A"), pt.size = 0)
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/Ctla4.pdf",width = 10, height =15)
+VlnPlot(DATA.T, features = c("Ctla4", "Lgals3", "Csf2", "Csf2rb", "Csf2ra"),  group.by = "Subtypes",split.by = "Condition", cols = c("#8F5C98","#30409A"), ncol =2)
+VlnPlot(DATA.T, features = c("Ctla4", "Lgals3", "Csf2", "Csf2rb", "Csf2ra"),  group.by = "Subtypes",split.by = "Condition", cols = c("#8F5C98","#30409A"),pt.size = 0, ncol =2)
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/GF.pdf",width = 10, height =4.9)
+VlnPlot(DATA_Myeloid, features =c("Nrg1","Nrg2","Negr1","Csf3r") ,  group.by = "Subtypes",cols =c("#DDDE1A", "#DCED9E", "#AEDFC1", "#90C2B9", "#999999"),stack = T,flip = T)
+VlnPlot(DATA_Myeloid, features =c("Nrg1","Nrg2","Negr1") ,  group.by = "Subtypes2",split.by = "Condition",cols = c("#8F5C98","#30409A"),stack = T,flip = T)
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/Mertk.pdf",width = 10, height =3)
+VlnPlot(DATA_Myeloid, features = "Mertk",  group.by = "Subtypes2",split.by = "Condition",cols = c("#8F5C98","#30409A"))
+dev.off()
+
+DATA_HG <- SetIdent(DATA, value = "Celltypes") %>% subset(idents = c( "High Granularity Cells"))
+pdf("results/Brain_Cd45_HG/Targeted_genes/HG_RNA.pdf",width = 6.5, height =4.9)
+VlnPlot(DATA_HG, features ="nCount_RNA" ,  group.by = "Subtypes",cols =c("#DDDE1A", "#DCED9E", "#AEDFC1", "#90C2B9", "#999999"))
+VlnPlot(DATA_HG, features ="nFeature_RNA" ,  group.by = "Subtypes",cols =c( "#DDDE1A", "#DCED9E","#AEDFC1", "#90C2B9", "#999999"))
+VlnPlot(DATA_HG, features ="nCount_RNA" ,  group.by = "Subtypes", split.by = "Condition",cols = c("#8F5C98","#30409A"))
+VlnPlot(DATA_HG, features ="nFeature_RNA" ,  group.by = "Subtypes",split.by = "Condition",cols = c("#8F5C98","#30409A"))
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Targeted_genes/GPR31b.pdf",width = 5, height = 3)
+VlnPlot(DATA, features = c("Gpr31b"),group.by = "Subtypes2", split.by = "Condition")
+VlnPlot(DATA, features = c("Gpr31b"),group.by = "Subtypes2")
+dev.off()
+```

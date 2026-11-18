@@ -1,0 +1,130 @@
+---
+title: "Brain CD45 and HG cells: SCENIC"
+format: html
+---
+
+Loom file for pySCENIC (run on UPPMAX) and downstream analysis of the regulons.
+Starts from `data/scrna/Cd45_HG.rds`, saved by `02_merge_CD45_HG.Rmd`.
+
+## Load library
+```{r}
+library(Seurat)
+library(tidyverse)
+library(cowplot)
+library(SeuratDisk)
+dir.create("results/Brain_Cd45_HG/SCENIC", recursive = TRUE, showWarnings = FALSE)
+```
+
+## SCENIC 
+### prepare the Loom Object for SCENIC
+```{r}
+DATA <- readRDS("data/scrna/Cd45_HG.rds")
+DATA.loom <- as.loom(DATA, filename = "results/Brain_Cd45_HG/SCENIC/Cd45_HG.loom")
+DATA.loom$close_all()
+
+DATA@meta.data$Subtype_Con <- ""
+DATA@meta.data[Cells(DATA), "Subtype_Con"] <- paste0(DATA$Subtypes2,"_", DATA$Condition)
+
+write.csv(DATA@meta.data[,"Subtype_Con", drop=FALSE], file="results/Brain_Cd45_HG/SCENIC/CellAnnot_SubtypeCon.csv", quote=FALSE)
+```
+
+The calculation was performed in UPPMAX and python. Here is the script for the downstream anaylsis and visualization 
+```{r}
+
+scenic_regulon_umap<-read.table("results/Brain_Cd45_HG/SCENIC/scenic_umap.txt", row.names = 1)
+dim(scenic_regulon_umap)
+# 48335     2
+scenic_auc_mtx<-read.table("results/Brain_Cd45_HG/SCENIC/scenic_auc_mtx.txt", header=TRUE, row.names = 1, check.names = FALSE)
+dim(scenic_auc_mtx)
+# 48335   424
+scenic_RSS_Celltypes<-read.table("results/Brain_Cd45_HG/SCENIC/scenic_RegulonSpecificityScores_Celltypes.txt", header=TRUE, row.names = 1, check.names = FALSE, sep = '\t')
+dim(scenic_RSS_Celltypes)
+# 6 424
+
+```
+
+```{r}
+## Make up Seurat object
+colnames(scenic_regulon_umap)<-c("UMAP_1", "UMAP_2")
+reduction_regulon_umap <- CreateDimReducObject(
+  embeddings = as.matrix(scenic_regulon_umap),
+  stdev = as.numeric(apply(scenic_regulon_umap, 2, sd)),
+  key = "UMAP",
+  assay = "RNA"
+)
+DATA@reductions[["UMAP_regulon"]]<-reduction_regulon_umap
+rm(scenic_regulon_umap, reduction_regulon_umap)
+DimPlot(DATA, reduction = "UMAP_regulon", group.by="Subtypes2", shuffle = TRUE)
+```
+
+```{r}
+RSS_matrix<-t(scenic_RSS_Celltypes)
+rm(scenic_RSS_Celltypes)
+AUC_matrix<-t(scenic_auc_mtx)
+rm(scenic_auc_mtx)
+
+regulons<-rownames(RSS_matrix)
+identical(regulons, rownames(AUC_matrix))
+#TRUE
+
+topreg<-list()
+for (i in seq(ncol(RSS_matrix))) {
+  topreg[[i]]<-head(regulons[order(RSS_matrix[,i], decreasing = TRUE)], 20)
+}
+names(topreg)<-colnames(RSS_matrix)
+
+DATA@assays[["AUC"]]<-CreateAssayObject(data=AUC_matrix)
+
+DATA@assays[["AUC"]]@key<-"auc_"
+DATA@reductions[["UMAP_regulon"]]@assay.used<-"AUC"
+
+DATA
+
+```
+```{r}
+DATA@active.assay<-"AUC"
+FeaturePlot(DATA, features = feature)
+# feature<-"Msx1(+)"
+
+for (i in names(topreg)) {
+  for (feature in topreg[[i]]) {
+    gene<-sub("\\([+-]\\)$", "", feature, perl=TRUE)
+    p_gene<-FeaturePlot(DATA, feature=gene, reduction = "umap.harmony", order=TRUE)
+    p_regulon<-FeaturePlot(DATA, feature=feature, reduction = "umap.harmony", order=TRUE)
+    ggsave(paste0("results/Brain_Cd45_HG/SCENIC/AUC_featurePlot_", i, "_", gene, ".png"), plot_grid(ncol = 2, p_gene, p_regulon), width=8, height=4)
+  }
+}
+
+
+pdf("results/Brain_Cd45_HG/SCENIC/RidgePlot_Tfec.pdf", width = 18, height = 8)
+RidgePlot(DATA, features ="Tfec(+)" )
+dev.off()
+
+pdf("results/Brain_Cd45_HG/SCENIC/Vln_Tfec.pdf", width = 18, height = 8)
+VlnPlot(DATA, features ="Tfec(+)", pt.size = 0.5 )
+VlnPlot(DATA, features ="Tfec(+)", pt.size = 0.5,split.by = "Condition" )
+dev.off()
+
+
+saveRDS(DATA, "results/Brain_Cd45_HG/SCENIC/SCENIC_obj.rds")
+DATA <- readRDS("results/Brain_Cd45_HG/SCENIC/SCENIC_obj.rds")
+```
+
+```{r}
+DATA@active.assay<-"AUC"
+pdf("results/Brain_Cd45_HG/SCENIC/Vln_Rfx.pdf", width = 18, height = 8)
+VlnPlot(DATA, features =c("Rfx1(+)","Tfec(+)"), pt.size = 0.1,cols = color, stack = T,flip = T )
+VlnPlot(DATA, features ="Rfx1(+)", pt.size = 0.5,split.by = "Condition" )
+VlnPlot(DATA, features ="Rfx1(+)", pt.size = 0 ,cols = color )
+VlnPlot(DATA, features ="Rfx1(+)", pt.size = 0,split.by = "Condition")
+dev.off()
+
+
+pdf("results/Brain_Cd45_HG/SCENIC/HG_Vln_Rfx.pdf", width = 5.5, height =5.5)
+VlnPlot(DATA %>% SetIdent(value = "Celltypes") %>% subset(idents = c("High Granularity Cells")), group.by = "Subtypes",features =c("Rfx1(+)"), pt.size = 0.1,cols = color)
+VlnPlot(DATA %>% SetIdent(value = "Celltypes") %>% subset(idents = c("High Granularity Cells")), features ="Rfx1(+)",group.by = "Subtypes", pt.size = 0.5,split.by = "Condition" )
+VlnPlot(DATA %>% SetIdent(value = "Celltypes") %>% subset(idents = c("High Granularity Cells")), features ="Rfx1(+)", group.by = "Subtypes",pt.size = 0 ,cols = color )
+VlnPlot(DATA %>% SetIdent(value = "Celltypes") %>% subset(idents = c("High Granularity Cells")), features ="Rfx1(+)", group.by = "Subtypes",pt.size = 0,split.by = "Condition")
+dev.off()
+
+```

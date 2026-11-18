@@ -1,0 +1,78 @@
+---
+title: "Brain CD45 and HG cells: NicheNet"
+output: html_document
+---
+
+Brain CD45+ immune cells and high granularity (HG) cells from PBS- and AEC-treated mice (GEO: GSE301590).
+
+NicheNet: ligands from mast cells that explain the changes in Il4 Th2 cells between AEC and PBS.
+Starts from `data/scrna/Cd45_HG.rds`, saved by `02_merge_CD45_HG.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load the packages
+```{r Load the Packages}
+library(Seurat)
+library(cowplot)
+library(patchwork)
+library(Matrix)
+library(nichenetr)
+library(tidyverse)
+
+for (d in c("data/scrna", "results/Brain_Cd45_HG/Targeted_genes", "results/Brain_Cd45_HG/Trajectory", "results/Brain_Cd45_HG/NicheNet", "results/Brain_Cd45_HG/tradeseq_input")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# NicheNet
+#### Load the database
+```{r Load the dataBase}
+DATA <- readRDS("data/scrna/Cd45_HG.rds")
+DATA <- SetIdent(DATA, value = "Subtypes2")
+
+lr_network = readRDS(url("https://zenodo.org/record/7074291/files/lr_network_mouse_21122021.rds"))
+ligand_target_matrix = readRDS(url("https://zenodo.org/record/7074291/files/ligand_target_matrix_nsga2r_final_mouse.rds"))
+weighted_networks = readRDS(url("https://zenodo.org/record/7074291/files/weighted_networks_nsga2r_final_mouse.rds"))
+
+lr_network = lr_network %>% distinct(from, to)
+head(lr_network)
+ligand_target_matrix[1:5,1:5] # target genes in rows, ligands in columns
+```
+
+```{r NicheNet Mast cells to Il4 Th2 cells}
+nichenet_output = nichenet_seuratobj_aggregate(
+  seurat_obj = DATA,
+  receiver = "Il4 Th2 Cells",
+  condition_colname = "Condition", condition_oi = "AEC", condition_reference = "PBS",
+  sender = "Mast Cells",
+  ligand_target_matrix = ligand_target_matrix,
+  lr_network = lr_network,
+  weighted_networks = weighted_networks, top_n_ligands = 100,cutoff_visualization= 0.1)
+
+write.csv(nichenet_output$ligand_activities, "results/Brain_Cd45_HG/NicheNet/NicheNet_Mast_Il4Tcell_ligand_activities.csv", row.names = FALSE)
+
+pdf(file = "results/Brain_Cd45_HG/NicheNet/NicheNet_Mast_Il4Tcell.pdf", width = 15, height =12)
+nichenet_output$ligand_activity_target_heatmap
+nichenet_output$ligand_target_heatmap
+nichenet_output$ligand_receptor_heatmap
+dev.off()
+```
+
+#### Which cell types express the top ligands
+```{r}
+avg_expression_ligands = AggregateExpression(DATA, features = nichenet_output$top_ligands)
+sender_ligand_assignment = avg_expression_ligands$RNA %>% apply(1, function(ligand_expression){
+  ligand_expression > (ligand_expression %>% mean() + ligand_expression %>% sd())
+  }) %>% t()
+sender_ligand_assignment = sender_ligand_assignment %>% apply(2, function(x){x[x == TRUE]}) %>% purrr::keep(function(x){length(x) > 0})
+names(sender_ligand_assignment)
+```
+
+```{r}
+VlnPlot(DATA %>% subset(idents = "Monocyte 5"), features =  "Osm", group.by = "Condition")
+DotPlot(DATA %>% subset(idents = "Monocyte 5"), features =  nichenet_output$top_ligands %>% rev(), split.by = "Condition") + coord_flip()
+VlnPlot(DATA %>% subset(idents = "Il4 Th2 Cells"), features =  c("Ivns1abp","Maf"), group.by = "Condition")
+VlnPlot(DATA %>% subset(idents = "Reactive Microglia"), features =  "Pim1" , split.by = "Condition") + coord_flip()
+```

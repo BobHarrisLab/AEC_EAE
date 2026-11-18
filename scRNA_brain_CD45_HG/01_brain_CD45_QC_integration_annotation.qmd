@@ -1,0 +1,409 @@
+---
+title: "Brain CD45 cells: QC, integration and annotation"
+format: html
+---
+
+## Load the libraries
+
+```{r Load the libraries}
+library(Seurat)
+library(tidyverse)
+library(gprofiler2)
+library(DoubletFinder)
+library(cowplot)
+library(SeuratWrappers)
+library(niceRplots)
+library(clustree)
+
+#Enrichment 
+library(correlationAnalyzeR)
+library(clusterProfiler)
+library(xlsx)
+library(gprofiler2)
+library(plotly)
+library(DOSE)
+```
+
+## Quality Control
+
+```{r preprocess the data}
+#For cellbender processed data
+DATA <- Read_CellBender_h5_Mat(file_name = "data/scrna/cell/sc1_cellbender_filtered.h5")
+
+#For Cellranger processed data
+DATA <- Read10X_h5("data/scrna/cell/sample_filtered_feature_bc_matrix.h5")
+
+
+DATA <- CreateSeuratObject(counts = DATA, names.field = 3, names.delim = "_")
+#Start with PBS group----
+DATA$Condition <- "PBS"
+```
+
+```{r Calculate QC}
+DATA <- PercentageFeatureSet(DATA, "^mt-", col.name = "percent_mito")
+DATA <- PercentageFeatureSet(DATA, "^Rp[sl]", col.name = "percent_ribo")
+#Percentage hemoglobin genes - includes all genes starting with HB except HBP.
+DATA <- PercentageFeatureSet(DATA, "^Hb[^(p)]", col.name = "percent_hb")
+DATA <- PercentageFeatureSet(DATA, "Pecam1|Pf4", col.name = "percent_plat")
+
+#Plot QC
+VlnPlot(DATA, features = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb", "percent_plat"), pt.size = 0.1,ncol = 3) + NoLegend()
+
+
+
+DATA <- CellCycleScoring(DATA %>% NormalizeData(), g2m.features = gorth(cc.genes.updated.2019$g2m.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name, 
+    s.features= gorth(cc.genes.updated.2019$s.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name,set.ident = T)
+
+
+pdf("Brain_CD45/PBS_QC.pdf", width = 15, height = 8)
+VlnPlot(DATA, features = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb", "percent_plat","S.Score", "G2M.Score"), pt.size = 0.1,ncol = 3) + NoLegend()
+dev.off()
+```
+
+
+```{r plot QC}
+VlnPlot(DATA, features = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb", "percent_plat","S.Score", "G2M.Score"), pt.size = 0.1,ncol = 3) + NoLegend()
+
+hist(DATA$nFeature_RNA)
+range(DATA$nFeature_RNA)
+median(DATA$nFeature_RNA)
+sd(DATA$nFeature_RNA)
+
+#Visualize which genes contribute to reads most ----
+par(mar = c(4, 8, 2, 1))
+C <- DATA@assays$RNA@layers$counts
+rownames(C) <- rownames(DATA)
+colnames(C) <- colnames(DATA)
+C <- Matrix::t(Matrix::t(C)/Matrix::colSums(C)) * 100
+most_expressed <- order(apply(C, 1, median), decreasing = T)[20:1]
+boxplot(as.matrix(t(C[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = (scales::hue_pal())(20)[20:1], horizontal = TRUE)
+rm(C)
+
+```
+
+```{r QC}
+dim(DATA)
+#Depend on the QC plot, change the QC matrix
+DATA <- subset(DATA, subset = nFeature_RNA > 200 & percent_mito < 20 & percent_hb < 15) 
+dim(DATA) #Check cell number
+```
+
+```{r doubletfinder}
+DATA <- NormalizeData(DATA)
+DATA <- FindVariableFeatures(DATA)
+DATA <- ScaleData(DATA, vars.to.regress = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb","percent_plat","S.Score", "G2M.Score"))
+DATA <- RunPCA(DATA, npcs = 30)
+DATA <- RunUMAP(DATA, dims = 1:30)
+
+nExp <- round(ncol(DATA) * 0.031)  # expect 8% doublets for 10000 loaded cells (Check 10X loaded chart)
+DATA <- doubletFinder(DATA, pN = 0.25, pK = 0.09, nExp = nExp, PCs = 1:30)
+# name of the DF prediction can change, so extract the correct column name.
+colnames(DATA@meta.data)[grepl("DF.classification", colnames(DATA@meta.data))]
+DATA$DF <-  DATA$DF.classifications_0.25_0.09_192
+plot_grid(DimPlot(DATA, group.by = "orig.ident") + NoAxes(), 
+    DimPlot(DATA, group.by = "DF") + NoAxes()
+    #,FeaturePlot(DATA, features = c("Mki67","Pcna"))
+    ,ncol = 2)
+
+```
+
+
+```{r}
+saveRDS(DATA, "data/scrna/cell/PBS.rds")
+```
+
+## Integration
+
+
+```{r Load Seurat Object }
+DATA.PBS <- readRDS("data/scrna/cell/PBS.rds")
+DATA.AEC <- readRDS("data/scrna/cell/AEC.rds")
+```
+
+
+
+```{r Create a Merged Object}
+DATA <- merge(DATA.PBS,DATA.AEC) %>% JoinLayers()
+
+DATA <- DATA %>% SetIdent(value ="DF") %>% subset(idents = "Singlet")
+table(DATA$Condition)
+
+```
+
+```{r}
+#integrate data----
+DATA[['RNA']] <- split(DATA[['RNA']], f = DATA$Condition)
+
+DATA <- NormalizeData(DATA)
+
+DATA <- FindVariableFeatures(DATA)
+VariableFeatures(DATA) = SelectIntegrationFeatures5(DATA)
+
+DATA <- ScaleData(DATA,vars.to.regress = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb","percent_plat","S.Score","G2M.Score"))
+
+DATA <- RunPCA(DATA, npcs=50)
+ElbowPlot(DATA,ndims = 50)
+
+```
+
+```{r}
+#unintegrated
+DATA <- FindNeighbors(DATA, dims = 1:50, reduction = "pca")
+DATA <- RunUMAP(DATA, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+p1<-DimPlot(DATA, reduction = "umap.unintegrated", group.by  = c("Condition"),shuffle = T)+ggtitle("unintegrated")
+#CCA
+DATA <- IntegrateLayers(
+  object = DATA, method = CCAIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.cca"
+)
+DATA <- FindNeighbors(DATA, reduction = "integrated.cca", dims = 1:30)
+DATA <- RunUMAP(DATA, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca")
+
+
+DATA <- IntegrateLayers(
+  object = DATA, method = scVIIntegration,
+  conda_env = "path/to/conda/envs/scvi" # conda environment with scvi-tools,
+  orig.reduction = "pca", new.reduction = "integrated.cca"
+)
+#Harmony
+DATA <- IntegrateLayers(
+  object = DATA, method = HarmonyIntegration,
+  orig.reduction = "pca", new.reduction = "harmony"
+)
+DATA <- FindNeighbors(DATA, reduction = "harmony", dims = 1:30)
+DATA <- RunUMAP(DATA, reduction = "harmony", dims = 1:40, reduction.name = "umap.harmony")
+DimPlot(DATA, reduction = "umap.harmony", group.by = "Louvain_1.5",label = T) + ggtitle("Louvain_1.5")
+
+DimPlot(DATA,group.by = "Condition",reduction = "umap.harmony", shuffle = T,)+ggtitle("Harmony")
+
+p2<- DimPlot(DATA,group.by = "Condition",reduction = "umap.harmony", shuffle = T,)+ggtitle("Harmony")
+p3<-DimPlot(DATA,group.by = "Condition",reduction = "umap.cca", shuffle = T)+ggtitle("CCA")
+
+DimPlot(DATA,group.by = "SampleID",reduction = "umap.cca", split.by = "Condition",shuffle = T)+ggtitle("CCA")
+plot_grid(p2,p3,ncol=2)
+
+pdf("results/Brain_CD45/Integration.pdf", width = 10, height = 6)
+plot_grid(p1,p2,p3,ncol=2)
+dev.off()
+```
+
+## Clustering
+```{r}
+DATA <- FindNeighbors(DATA, reduction = "harmony",dims = 1:40, k.param = 8)
+
+#Louvain Clusters
+for (res in c(0.1, 0.25, 0.5,0.75, 1,1.5,2, 2.5)) {
+  print(paste0("current res is ", res))
+    DATA <- FindClusters(DATA, graph.name = "RNA_snn", cluster.name = paste0("Louvain_",res),  resolution = res, algorithm = 1)
+}
+clustree(DATA@meta.data, prefix = "Louvain_")
+
+
+```
+
+```{r}
+plot_grid(ncol = 2, 
+          DimPlot(DATA, reduction = "umap.harmony", group.by = "Louvain_0.1",label = T) + ggtitle("Louvain_0.1"), 
+          DimPlot(DATA, reduction = "umap.harmony", group.by = "Louvain_0.5",label = T) + ggtitle("Louvain_0.5"),
+          DimPlot(DATA, reduction = "umap.harmony", group.by = "Louvain_1",label = T) + ggtitle("Louvain_1"),
+          DimPlot(DATA, reduction = "umap.harmony", group.by = "Louvain_1.5",label = T) + ggtitle("Louvain_1.5"),
+          DimPlot(DATA, reduction = "umap.harmony", group.by = "Louvain_2",label = T) + ggtitle("Louvain_2"))
+
+```
+
+
+```{r DEG and Annotation}
+
+#We go for Leiden 1.5
+DATA <- SetIdent(DATA, value = "Louvain_2")
+DATA <- JoinLayers(DATA)
+
+DefaultAssay(DATA) <-  "RNA"
+detable_all <- FindAllMarkers(DATA, log2FC.threshold = 0.2, 
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+  detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+  detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(50, log.pct.diff)  %>% top_n(-25, p_val)-> top25
+plot_dots(DATA,genes = unique(top25$gene), clustering = "Leiden_1.5",pal = c("#cfc8d7","#a577f2", "#0434ff"),cex.row = 0.6)
+write.csv(top25, file = "results/Brain_CD45/Major_Markers_top25.csv")
+write.csv(detable_all, file = "results/Brain_CD45/Major_Markers_All.csv")
+
+FeaturePlot(DATA, c("Cd3e","Cd3d", "Cd4", "Cd8a", "Nkg7","Cd19", "Ms4a1", "Cd14", "Ms4a7",
+     "Cst3", "Fcer1a", "Ptprc", "Cd68", "P2ry12","Tmem119", "Hexb", "Csf1r", "Itgam", "Ly6c"))
+
+FeaturePlot(DATA, c( "Cd4","Nkg7"),order = T, reduction = "umap.harmony")
+
+VlnPlot(DATA, c( "Cd4","Nkg7"))
+
+saveRDS(DATA, "data/scrna/Brain_Cd45/data_clustered.rds")
+
+
+```
+
+```{r Annotation}
+DimPlot(DATA,label =T)
+new.cluster.ids <- c("Microglia", "Microglia", "T Cells", "Microglia", "Microglia", "Microglia", "Microglia", "Microglia", "Microglia", "Microglia", "Microglia", "T Cells", "T Cells", "Monocytes", "B Cells", "NK Cells", "Microglia", "Microglia", "T Cells", "T Cells", "Microglia", "Dendritic Cells", "Microglia", "Macrophages", "Macrophages", "Neutrophil", "Microglia", "Microglia", "B Cells", "Neutrophil", "T Cells", "Dendritic Cells", "Mast Cells", "Microglia")
+
+names(new.cluster.ids) <- as.character(0:33)
+
+
+DATA <- SetIdent(DATA, value = "Louvain_2")
+
+DATA <- RenameIdents(DATA, new.cluster.ids)
+DimPlot(DATA,label =T, reduction = "")
+DATA$Celltypes <- DATA@active.ident
+
+pdf("results/Brain_CD45/Celltypes.pdf", width = 8, height = 4.5)
+DimPlot(DATA,group.by = "Celltypes", alpha = 0.6, reduction = "umap.harmony")
+dev.off()
+```
+
+```{r Proportions}
+summarized.df <- DATA@meta.data %>%
+  group_by(Condition, Celltypes) %>% # In you case you should group by "day" and "Clusters"
+  summarize(nCells = n()) %>%
+  group_by(Condition) %>% # This should be changed for "day"
+  mutate(prop = nCells/sum(nCells))
+
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = Celltypes), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip()
+```
+
+## Microglia subtypes 
+
+```{r}
+DATA <- SetIdent(DATA, value = "Celltypes")
+DATA <- subset(DATA, idents = c("Microglia"))
+
+DATA <- RunUMAP(DATA, reduction = "harmony", dims = 1:40, reduction.name = "umap.harmony.2")
+FeaturePlot(DATA, reduction = "umap.harmony.2", features = "Clec7a")
+ 
+plot_grid(DimPlot(DATA, group.by = "Celltypes", reduction = "umap.harmony", pt.size = 1, alpha = 0.7), 
+          DimPlot(DATA, group.by = "Celltypes", reduction = "umap.harmony.2", pt.size = 1, alpha = 0.7))
+FeaturePlot(DATA, features = c("Cd3e","Cd4","Cd8a","Cd8b1","Foxp3", "Il2ra"), reduction = "umap")
+
+```
+
+```{r reclustering}
+DATA <- FindNeighbors(DATA ,reduction = "harmony",dims = 1:35, k.param = 15)
+
+
+#Louvain Clusters
+for (res in c(0.1, 0.25, 0.5,0.75, 1,1.5,2, 2.5)) {
+  print(paste0("current res is ", res, " in Louvain Cluster"))
+    DATA <- FindClusters(DATA, graph.name = "RNA_snn", cluster.name = paste0("Louvain_",res),  resolution = res, algorithm = 1)
+}
+clustree(DATA@meta.data, prefix = "Louvain_")
+
+
+#Leiden Clusters
+for (res in c(0.1, 0.25, 0.5,0.75, 1,1.5,2, 2.5)) {
+  print(paste0("current res is ", res, " in Leiden Cluster"))
+    DATA@meta.data[paste0('Leiden_' , as.character(res))] <- leiden(DATA@graphs$RNA_snn, resolution_parameter = res, seed = 1)
+}
+
+plot_grid(clustree(DATA@meta.data, prefix = "Louvain_")+ggtitle("Louvain Cluster"),clustree(DATA@meta.data, prefix = "Leiden_")+ggtitle("Leiden Clsuter"))
+
+
+plot_grid(ncol = 2, 
+          DimPlot(DATA, reduction = "umap.harmony.2", group.by = "Louvain_0.1",label = T) + ggtitle("Louvain_0.1"), 
+          DimPlot(DATA, reduction = "umap.harmony.2", group.by = "Louvain_0.5",label = T) + ggtitle("Louvain_0.5"),
+          DimPlot(DATA, reduction = "umap.harmony.2", group.by = "Louvain_1",label = T) + ggtitle("Louvain_1"),
+          DimPlot(DATA, reduction = "umap.harmony.2", group.by = "Louvain_1.5",label = T) + ggtitle("Louvain_1.5"),
+          DimPlot(DATA, reduction = "umap.harmony.2", group.by = "Louvain_2",label = T) + ggtitle("Louvain_2")
+          #,
+          #DimPlot(DATA, reduction = "umap", group.by = "Leiden_0.1", label = T) + ggtitle("Leiden_0.1"),
+          #DimPlot(DATA, reduction = "umap", group.by = "Leiden_0.5",label = T) + ggtitle("Leiden_0.5"), 
+          #DimPlot(DATA, reduction = "umap", group.by = "Leiden_1",label = T) + ggtitle("Leiden_1"), 
+          #DimPlot(DATA, reduction = "umap", group.by = "Leiden_1.5",label = T) + ggtitle("Leiden_1.5"),
+          #DimPlot(DATA, reduction = "umap", group.by = "Leiden_2",label = T) + ggtitle("Leiden_2")
+           )
+```
+
+```{r DEGs}
+DATA <- SetIdent(DATA, value = "Louvain_1")
+
+DefaultAssay(DATA) <-  "RNA"
+detable_all <- FindAllMarkers(DATA, log2FC.threshold = 0.2, 
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+  detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+  detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(50, log.pct.diff)  %>% top_n(-25, p_val)-> top25
+plot_dots(DATA,genes = unique(top25$gene), clustering = "Leiden_1.5",pal = c("#cfc8d7","#a577f2", "#0434ff"),cex.row = 0.6)
+
+write.csv(top25, file = "results/Brain_CD45/Mic_top25.csv")
+write.csv(detable_all, file = "results/Brain_CD45/Mic_All.csv")
+
+DotPlot(DATA, features = c("Spp1", "Clec7a", "Ly6c2","Cd36", "Lpl","Ptprc","Mertk","Axl","Cd68","Trem2","Mrc1","Cd163","Msr1","Siglec1","Cd200r4", "Irf4","Lgals3","Jun"), group.by = "Leiden_1")+coord_flip()
+
+FeaturePlot(DATA, features = c("Crybb1","Tmem119","P2ry12","Csf1","Mcm5","Ifit3", "Ptprc"),reduction = "umap")
+VlnPlot(DATA, features = c("Mrc1","Crybb1","Tmem119","P2ry12","Csf1","Mcm5","Ifit3","Cst7","Mif","Ccl12","Ccl3","Ccl4","Plp1","Pltp"),group.by= "Leiden_1", pt.size = 0)
+
+VlnPlot(DATA, features = c("Clec7a", "Spp1","Egr1","Ifit3", "Trem2", "Apoe"),group.by= "Louvain_1", pt.size = 0)
+
+plot_dots(DATA, genes = c("Cd69","Cd79a","Cd38","Cd79a","H2-D1", "H2-K1","H2-Aa", "H2-Ab1", "H2-DMa", "H2-DMb1", "H2-DMb2", "H2-Ea-ps", "H2-Eb1",  "H2-M3", "H2-Ob", "H2-Q1", "H2-Q10", "H2-Q2", "H2-T23","Cd74","Ms4a1"),clustering = "Leiden_1", pal = c("#cfc8d7","#a577f2", "#0434ff"))
+
+
+
+```
+
+
+
+
+
+```{r Change the annotation}
+new.cluster.ids <- c("Microglia 1", "Microglia 1", "Microglia 1", "Microglia 2", "Microglia 1", "Microglia 3", "Microglia 1", "Microglia 4", "Microglia 1", "Microglia 5", "Microglia 5", "Microglia 2", "Microglia 1")
+
+
+
+DATA <- SetIdent(DATA, value = "Louvain_1")
+names(new.cluster.ids) <- c(0,2:13)
+DATA <- RenameIdents(DATA,new.cluster.ids)
+DATA$Subtypes <- DATA@active.ident
+
+ 
+plot_grid(
+          DimPlot(DATA, group.by = "Subtypes", reduction = "umap.harmony.2", pt.size = 1, alpha = 0.7, label = T, order =  c( "Microglia 4","Microglia 2","Microglia 1", "Microglia 3","Microglia 5")))
+
+pdf("results/Brain_CD45/Subtypes/Microglia.pdf", width = 6, height = 3.7)
+DimPlot(DATA, group.by = "Subtypes", reduction = "umap.harmony.2", pt.size = 1, shuffle  = T,)
+dev.off()
+```
+
+```{r Proportions}
+summarized.df <- DATA@meta.data %>%
+  group_by(Condition, Subtypes) %>% # In you case you should group by "day" and "Clusters"
+  summarize(nCells = n()) %>%
+  group_by(Condition) %>% # This should be changed for "day"
+  mutate(prop = nCells/sum(nCells))
+
+pdf("results/Brain_CD45/Proportions/Microglia_prop.pdf", width = 8, height = 3)
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = Subtypes), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip()
+dev.off()
+
+pdf("results/Brain_CD45/Proportions/Microglia_prop_V.pdf", width = 4, height = 8)
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = Subtypes), stat = "identity", color = "black") +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) 
+dev.off()
+
+```
+
+And subtypes for other cells was made in the same way. 

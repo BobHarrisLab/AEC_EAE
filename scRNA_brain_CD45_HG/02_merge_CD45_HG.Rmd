@@ -1,0 +1,199 @@
+---
+title: "Brain CD45 and HG cells: merge, markers and proportions"
+output: html_document
+date: "2024-01-30"
+---
+
+Brain CD45+ immune cells and high granularity (HG) cells from PBS- and AEC-treated mice (GEO: GSE301590), merged and integrated with Harmony.
+Cell type markers and proportions of the merged dataset.
+
+Input: `data/scrna/Brain_Cd45/data_Subtypes.rds` (from `01_brain_CD45_QC_integration_annotation.qmd`) and `data/scrna/Brain_progenitor/data_inted.rds` (HG cells).
+Output: `data/scrna/Cd45_HG.rds`, used by all later notebooks in this folder. Results: `results/Brain_Cd45_HG/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load the packages
+```{r Load the Packages}
+library(Seurat)
+library(cowplot)
+library(patchwork)
+library(Matrix)
+library(tidyverse)
+library(niceRplots)
+library(geomtextpath)
+
+for (d in c("data/scrna", "results/Brain_Cd45_HG/Targeted_genes", "results/Brain_Cd45_HG/Trajectory", "results/Brain_Cd45_HG/NicheNet", "results/Brain_Cd45_HG/tradeseq_input")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+### Make a Merged dataset
+```{r Make a Merged dataset}
+DATA <- readRDS("data/scrna/Brain_Cd45/data_Subtypes.rds")
+DATA_pro <- readRDS("data/scrna/Brain_progenitor/data_inted.rds")
+
+DATA$SampleID <- paste0("CD45_", DATA$Condition)
+DATA_pro$SampleID <- paste0("HG_", DATA_pro$Condition)
+
+DATA$orig.ident <- "CD45"
+DATA_pro$orig.ident <- "HG"
+
+DATA <- merge(DATA, DATA_pro) %>% JoinLayers()
+rm(DATA_pro)
+
+# New names for the subtypes, in the order of unique(DATA$Subtypes)
+new.cluster.ids <-c("B Cells 1",  "B Cells 2", "γδ T Cells 1",   "Th1 Cells",  "γδ T Cells 2", "Th1 Cells",  "Stem-like Cd4 T Cells",      "Cd8 T Cells","Proliferative T Cells",             "Regulatory T Cells",                "Il4 Th2 Cells",         "Th1 Cells", "NK Cells",    "Mast Cells",       "Neutrophil",  "Monocyte 5",  "Macrophage 3",   "Monocyte 1",   "Macrophage 1", "Monocyte 2", "Monocyte 3",      "Monocyte 4","Monocyte 6", "Macrophage 2",  "Homeostatic Microglia","Disease Accoiated Microglia",    "Intermediate  Microglia",  "IFN responsive  Microglia", "Reactive Microglia", "Proliferative Microglia",  "Dendritic Cells",       "HG_1",  "HG_2", "HG_3",  "HG_4", "HG_5")
+
+DATA <- SetIdent(DATA, value = "Subtypes")
+names(new.cluster.ids) <- unique(DATA$Subtypes)
+print(new.cluster.ids) # check that every old name is matched to the right new name
+DATA <- RenameIdents(DATA,new.cluster.ids)
+DATA@active.ident <- factor(DATA@active.ident,
+                           levels = c("B Cells 1", "B Cells 2", "γδ T Cells 1","γδ T Cells 2", "Th1 Cells",  "Stem-like Cd4 T Cells",  "Proliferative T Cells", "Il4 Th2 Cells",  "Cd8 T Cells", "Regulatory T Cells","NK Cells", "Mast Cells", "Neutrophil", "Dendritic Cells","Monocyte 1", "Monocyte 2", "Monocyte 3", "Monocyte 4","Monocyte 5", "Monocyte 6", "Macrophage 1", "Macrophage 2","Macrophage 3", "Homeostatic Microglia", "Intermediate  Microglia", "Disease Accoiated Microglia", "IFN responsive  Microglia", "Reactive Microglia", "Proliferative Microglia",  "HG_1", "HG_2", "HG_3", "HG_4", "HG_5") )
+
+DATA$Subtypes2 <- DATA@active.ident
+
+DefaultAssay(DATA) <- "RNA"
+table(DATA$Celltypes,DATA$Subtypes2)
+
+DATA[['RNA']] <- split(DATA[['RNA']], f = DATA$Condition)
+
+DATA <- NormalizeData(DATA)
+DATA <- FindVariableFeatures(DATA)
+VariableFeatures(DATA) = SelectIntegrationFeatures5(DATA, nfeatures = 3000)
+DATA <- ScaleData(DATA,vars.to.regress = c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo", "percent_hb","percent_plat","S.Score","G2M.Score"))
+
+DATA <- RunPCA(DATA,npcs = 50)
+
+#unintegrated
+DATA <- RunUMAP(DATA, dims = 1:50, reduction = "pca", reduction.name = "umap.unintegrated")
+p1<-DimPlot(DATA, reduction = "umap.unintegrated",shuffle = T,label = T)+ggtitle("unintegrated")+NoLegend()
+
+#Harmony
+DATA <- IntegrateLayers(
+  object = DATA, method = HarmonyIntegration,
+  orig.reduction = "pca", new.reduction = "harmony"
+)
+DATA <- RunUMAP(DATA, reduction = "harmony", dims = 1:40, reduction.name = "umap.harmony")
+p2<- DimPlot(DATA,group.by = "Subtypes2", reduction = "umap.harmony", shuffle = T,label = T)+ggtitle("Harmony") +NoLegend()
+plot_grid(p1,p2,ncol=2)
+
+ElbowPlot(DATA,ndims = 50)
+DATA <- JoinLayers(DATA)
+
+saveRDS(DATA, "data/scrna/Cd45_HG.rds")
+```
+
+```{r}
+pdf("results/Brain_Cd45_HG/Celltypes.pdf", width = 8, height = 4.5)
+DimPlot(DATA,reduction = "umap.harmony",group.by = "Celltypes", alpha = 0.6, shuffle = T, cols = c("#00BFC4", "#D89000","#3A86FF", "#06D6A0", "#073B4C","#E63946" , "#9590FF", "#E76BF3", "#FF62BC","#39B600"))
+DimPlot(DATA,reduction = "umap.harmony",group.by = "Celltypes", label = T,alpha = 0.6, shuffle = T,cols = c("#00BFC4", "#D89000","#3A86FF", "#06D6A0", "#073B4C","#E63946" , "#9590FF", "#E76BF3", "#FF62BC","#39B600"))
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Subtypes.pdf", width = 12, height = 6)
+DimPlot(DATA,reduction = "umap.harmony",group.by = "Subtypes2", alpha = 0.6, shuffle = T)
+DimPlot(DATA,reduction = "umap.harmony",group.by = "Subtypes2", alpha = 0.6, shuffle = T,label = T)
+dev.off()
+```
+
+Top5 Genes
+```{r Top5 Genes}
+DATA <- SetIdent(DATA, value = "Celltypes")
+
+DefaultAssay(DATA) <-  "RNA"
+detable_all <- FindAllMarkers(DATA, log2FC.threshold = 0.2, 
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = Inf,
+    assay = "RNA")
+
+detable_all <- detable_all[ detable_all$p_val < 0.05,  ]
+  detable_all$pct.diff <- detable_all$pct.1 - detable_all$pct.2
+  detable_all$log.pct.diff <- log2(detable_all$pct.1 / (detable_all$pct.2+0.01) )
+
+detable_all %>% group_by(cluster)  %>% top_n(-20, p_val) %>% top_n(5, log.pct.diff) -> top5
+plot_dots(DATA,genes = unique(top5$gene), clustering = "Celltypes",pal = c("#cfc8d7","#a577f2", "#0434ff"),cex.row = 0.6)
+
+DATA@active.ident <- factor(DATA@active.ident, 
+                            levels=c("B Cells", 
+                                     "T Cells",
+                                     "NK Cells", 
+                                     "Mast Cells",
+                                     "Neutrophil", 
+                                     "Monocytes", 
+                                     "Macrophages", 
+                                     "Microglia", 
+                                     "Dendritic Cells", 
+                                     "High Granularity Cells"))
+pdf("results/Brain_Cd45_HG/Celltypes_Marker.pdf", width = 7, height = 9)
+DotPlot(DATA, features = rev(unique(top5$gene))) + coord_flip()+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Celltypes_Marker_H.pdf", width = 13, height = 5)
+DotPlot(DATA, features = rev(unique(top5$gene))) +theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+dev.off()
+
+```
+
+
+```{r Proportions}
+summarized.df <- DATA@meta.data %>%
+  group_by(Condition, Celltypes) %>% # In you case you should group by "day" and "Clusters"
+  summarize(nCells = n()) %>%
+  group_by(Condition) %>% # This should be changed for "day"
+  mutate(prop = nCells/sum(nCells))
+
+
+pdf("results/Brain_Cd45_HG/Proportion_Cd45_H.pdf", width = 13, height = 5)
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = Celltypes), stat = "identity", color = "black") +
+  scale_fill_manual(values =  c("#00BFC4", "#D89000", "#06D6A0", "#073B4C","#E63946" , "#9590FF", "#E76BF3", "#FF62BC","#39B600"))+
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) + coord_flip()
+dev.off()
+
+pdf("results/Brain_Cd45_HG/Proportion_Cd45.pdf", width = 5, height = 13)
+ggplot() +
+  geom_bar(data = summarized.df, aes(Condition, prop, fill = Celltypes), stat = "identity", color = "black") +
+  scale_fill_manual(values =  c("#00BFC4", "#D89000", "#06D6A0", "#073B4C","#E63946" , "#9590FF", "#E76BF3", "#FF62BC","#39B600"))+
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent) 
+dev.off()
+
+AEC_Celltypes = summarized.df[summarized.df$Condition == "AEC",]
+PBS_Celltypes = summarized.df[summarized.df$Condition == "PBS",]
+
+AEC_Celltypes$fraction <- AEC_Celltypes$prop
+AEC_Celltypes = AEC_Celltypes %>%  mutate(percentage = round(fraction,3)*100)
+
+PBS_Celltypes = PBS_Celltypes %>%  mutate(percentage = round(prop,3)*100)
+
+
+pdf("results/Brain_Cd45_HG/Proportion_Cd45_Circle.pdf", width = 6, height = 5)
+ggplot(data = PBS_Celltypes, 
+       aes(x = 2, y = percentage, fill = Celltypes))+
+  geom_bar(stat = "identity", color = "black")+
+  scale_fill_manual(values =  c("#00BFC4", "#D89000", "#06D6A0", "#073B4C","#E63946" , "#9590FF", "#E76BF3", "#FF62BC","#39B600"))+
+  coord_polar("y", start = 200) +
+  #geom_text(aes(y = lab.pos, label = paste0(percentage,"%", sep = "")), col = "white") +
+  geom_textpath(position = position_stack(vjust = 0.5), angle = 90, size =3.5, col="white", aes( label= paste0(percentage,"%", sep = "")))+
+  theme_void() +
+  ggtitle("PBS")+
+  #scale_fill_brewer(palette = "Dark2")+
+  xlim(.2,2.5)
+
+ggplot(data = AEC_Celltypes, 
+       aes(x = 2, y = percentage, fill = Celltypes))+
+  geom_bar(stat = "identity", color = "black")+
+  scale_fill_manual(values =  c("#00BFC4", "#D89000", "#06D6A0", "#073B4C","#E63946" , "#9590FF", "#E76BF3", "#FF62BC","#39B600"))+
+  coord_polar("y", start = 200) +
+  #geom_text(aes(y = lab.pos, label = paste0(percentage,"%", sep = "")), col = "white") +
+  geom_textpath(position = position_stack(vjust = 0.5), angle = 90, size =3.5, col="white", aes( label= paste0(percentage,"%", sep = "")))+
+  theme_void() +
+  ggtitle("AEC")+
+  #scale_fill_brewer(palette = "Dark2")+
+  xlim(.2,2.5)
+dev.off()
+
+
+```

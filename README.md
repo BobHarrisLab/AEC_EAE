@@ -1,10 +1,12 @@
-# Human placental stem cells induce a novel multiple myeloid cell-driven immunosuppressive program that ameliorates proinflammatory CNS pathology
+# Human placental stem cells orchestrate an amyeloid cell-driven immunosuppressive program that ameliorates proinflammatory CNS pathology in experimental autoimmune encephalomyelitis
+
  
 Analysis code for the manuscript of the same title in *Nature Communications*.
  
 ## Abstract
  
-Despite a growing interest in Amniotic Epithelial Cell (AEC)-based therapies, the immune responses triggered by AEC transplantation in vivo remain poorly characterized, particularly within the central nervous system (CNS). Here, we show that intracisternal delivery of human AECs in mice with Experimental Autoimmune Encephalomyelitis (EAE) induces a CNS-specific immunoregulatory myeloid pathway , comprising immunosuppressive Arginase 1+ (ARG1+) macrophages and a population of myeloid-derived suppressor cells with eosinophilic characteristics, which we term Eo-MDSCs. Importantly, Eo-MDSCs diminish pathogenic T cell responses while increasing anti-inflammatory T cell subsets. In EAE mice with established disease, AEC-induced immunological responses results in reduced numbers of pathogenic macrophages and T helper (TH)17 cells, increased anti-inflammatory T cell subsets, and enhanced myelin phagocytosis, culminating in functional recovery. Thus, these findings suggest that AEC therapy can target CNS-intrinsic inflammatory processes in preclinical models of multiple sclerosis , providing a strong rationale for translation into the clinic.
+Despite a growing interest in Amniotic Epithelial Cell (AEC)-based Vijay Jinhtherapies, the immune responses triggered by AEC transplantation in vivo remain poorly characterized, particularly within the central nervous system (CNS). Here, we show that intracisternal delivery of human AECs in mice with Experimental Autoimmune Encephalomyelitis (EAE) induces a CNS-specific immunoregulatory myeloid pathway induced comprising immunosuppressive Arginase 1+ (ARG1+) macrophages and a population of myeloid-derived suppressor cells with eosinophilic characteristics, which we term Eo-MDSCs. Importantly, Eo-MDSCs diminish pathogenic T cell responses while increasing anti-inflammatory T cell subsets. In mice with established EAE disease, AEC-induced immunological responses result in reduced numbers of pathogenic macrophages and T helper (TH)17 cells, increased numbers of anti-inflammatory T cell subsets, and enhanced myelin phagocytosis, culminating in functional recovery. These findings thus suggest that AEC therapy can target CNS-intrinsic inflammatory processes in preclinical models of multiple sclerosis, providing a strong rationale for translation into the clinic.
+
  
 ## Data availability
  

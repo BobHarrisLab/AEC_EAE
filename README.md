@@ -15,9 +15,9 @@ Raw and processed data are deposited in public repositories. This repository con
 | Data | Accession | Samples | Analysed in |
 |---|---|---|---|
 | Bulk RNA-seq | [GSE301776](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE301776) | 16 samples: Ctrl, 6 h, 1 day and 3 days after AEC injection (n = 4 per time point) | `bulk_RNAseq/` |
-| Single-cell RNA-seq | [GSE301590](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE301590) | brain high-granularity (HG) cells and immune cells each from PBS- and AEC-treated mice| `scRNA_brain_CD45_HG/` |
+| Single-cell RNA-seq | [GSE301590](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE301590) | Brain high-granularity (HG) cells and immune cells each from PBS- and AEC-treated mice| `scRNA_brain_CD45_HG/` |
 | Single-cell RNA-seq | [GSE301590](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE301590) | Spinal cord immune cells each from PBS- and AEC-treated mice | `scRNA_PBS_vs_AEC/` |
-| Single-nucleus RNA-seq (10x On-Chip Multiplexing) | [GSE301590](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE301590) | Ctrl, day 1, day 4 and day 7 (n = 4 per time point, multiplexed into 4 libraries) | `snRNA_brain_border_timecourse/` |
+| Single-nucleus RNA-seq (10x On-Chip Multiplexing) | [GSE301590](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE301590) | Ctrl, day 1, day 4 (n = 4 per time point, multiplexed into 4 libraries) | `snRNA_brain_border_timecourse/` |
 | Proteomics (label-free LC-MS/MS) | [PXD077193](https://www.ebi.ac.uk/pride/archive/projects/PXD077193) | Sorted HG cells vs microglia from AEC-treated mouse brain (n = 5 per group, plus 3 pilot HG samples) | `proteomics/` |
  
 All data are from mouse; reads were aligned to the GRCm39 reference genome.

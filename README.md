@@ -77,7 +77,7 @@ Each `.qmd` notebook can be run in RStudio/Positron or rendered with `quarto ren
  
 If you use this code, please cite:
  
-> Guo Y\*, Bencina S\*, Virgilio GA\*, Zhu K, Joshua V, Cheng Y, Lin J, Min J-H, Benito-Cuesta I, Suerth V, Trigo Alonso P, Xu F, Massa A, Thomas OG, Rykaczewska U, Göritz C, Ortlieb Guerreiro Cacais A, Jagodic M, Pahlevan Kakhki M, Gramignoli R, Harris RA\*#, Sarlus H\*#. Human placental stem cells induce a novel multiple myeloid cell-driven immunosuppressive program that ameliorates proinflammatory CNS pathology. *Nature Communications* .
+> Guo Y\*, Bencina S\*, Virgilio GA\*, Zhu K, Joshua V, Cheng Y, Lin J, Min J-H, Benito-Cuesta I, Suerth V, Trigo Alonso P, Xu F, Massa A, Thomas OG, Rykaczewska U, Göritz C, Ortlieb Guerreiro Cacais A, Jagodic M, Pahlevan Kakhki M, Gramignoli R, Harris RA\*#, Sarlus H\*#. Human placental stem cells orchestrate an amyeloid cell-driven immunosuppressive program that ameliorates proinflammatory CNS pathology in experimental autoimmune encephalomyelitis *Nature Communications* .
 >
 > \*Equal contribution. #Corresponding authors.
  
